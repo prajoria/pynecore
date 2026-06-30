@@ -26,7 +26,7 @@ import re
 
 import pytest
 
-from openbb_pine.compiler import compile_pine, ir
+from openbb_pine.compiler import compile_pine, compile_pine_to_program, ir
 from openbb_pine.compiler.v5_migration import (
     V5Rewrite,
     V5_REWRITES,
@@ -355,7 +355,17 @@ class TestEndToEnd:
 
 
 class TestCompilePineFacade:
-    """``compile_pine`` should hide migration entirely from typical callers."""
+    """``compile_pine_to_program`` should hide migration entirely from
+    typical callers.
+
+    These tests use :func:`compile_pine_to_program` (the C7-bead-era
+    ``compile_pine``-but-returning-IR surface) — the public
+    :func:`compile_pine` was extended in Wave 4 (C5 codegen) to return
+    a full :class:`CompiledModule` with emitted Python source. The IR-
+    inspection surface those C7 tests need lives at the lower-level
+    helper. See the docstring on ``compile_pine_to_program`` for the
+    rationale split.
+    """
 
     def test_v5_indicator_script_compiles(self) -> None:
         """The canonical M1-gate scenario: a v5 RSI script compiles unedited."""
@@ -364,7 +374,7 @@ class TestCompilePineFacade:
             'study("RSI")\n'
             "plot(ta.rsi(close, 14))\n"
         )
-        prog = compile_pine(src)
+        prog = compile_pine_to_program(src)
         assert isinstance(prog, ir.Program)
         assert prog.version == 6  # migrated
         # The directive should be `indicator`, not `study` — Program IR
@@ -378,7 +388,7 @@ class TestCompilePineFacade:
             'indicator("RSI")\n'
             "plot(ta.rsi(close, 14))\n"
         )
-        prog = compile_pine(src)
+        prog = compile_pine_to_program(src)
         assert isinstance(prog, ir.Program)
         assert prog.version == 6
         assert prog.directive.kind == "indicator"
@@ -390,31 +400,31 @@ class TestCompilePineFacade:
             "plot(close, color=color.red, transp=20)\n"
             "y = iff(close > open, close, open)\n"
         )
-        prog = compile_pine(src)
+        prog = compile_pine_to_program(src)
         assert prog.version == 6
         assert prog.directive.kind == "indicator"
 
     def test_no_pragma_uses_v6_default(self) -> None:
         src = 'indicator("X")\nplot(close)\n'
-        prog = compile_pine(src)
+        prog = compile_pine_to_program(src)
         assert prog.version == 6
 
     def test_v4_raises_pf001(self) -> None:
         with pytest.raises(PineUnsupportedFeatureError) as exc:
-            compile_pine('//@version=4\nstudy("X")\n')
+            compile_pine_to_program('//@version=4\nstudy("X")\n')
         assert "PF001" in str(exc.value)
 
     def test_v7_raises_pf002(self) -> None:
         with pytest.raises(PineUnsupportedFeatureError) as exc:
-            compile_pine('//@version=7\nindicator("X")\n')
+            compile_pine_to_program('//@version=7\nindicator("X")\n')
         assert "PF002" in str(exc.value)
 
     def test_target_version_must_be_5_or_6(self) -> None:
         with pytest.raises(PineUnsupportedFeatureError):
-            compile_pine('indicator("X")\n', target_version=7)
+            compile_pine_to_program('indicator("X")\n', target_version=7)
 
     def test_returns_ir_program_type(self) -> None:
-        prog = compile_pine('//@version=6\nindicator("X")\n')
+        prog = compile_pine_to_program('//@version=6\nindicator("X")\n')
         assert type(prog).__name__ == "Program"
 
 
