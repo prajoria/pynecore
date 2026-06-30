@@ -218,6 +218,112 @@ class TestPineUnsupportedFeatureErrorStructuredInit:
 
 
 # ---------------------------------------------------------------------------
+# PineCodegenError
+# ---------------------------------------------------------------------------
+
+
+class TestPineCodegenErrorStructuredInit:
+    """Mirror of the PineTypeError tests for the C5 codegen-gate error.
+
+    Added as a preempt fix (same shape as the post-R2/R6/Wave-3A pattern)
+    so the C5 ``_enforce_allowlist`` raises with structured attrs the REST
+    envelope (D3 §4.1) renders as PRD §4.8 JSON.
+    """
+
+    def test_structured_init_populates_all_attrs(self) -> None:
+        from openbb_pine.errors import PineCodegenError
+
+        exc = PineCodegenError(
+            rule="CG001",
+            node_kind="ast.Lambda",
+            allowlist_member="any of NODE_TYPE_ALLOWLIST per D1 §3.2",
+            tracking_url="https://example/issues/pine-codegen",
+        )
+        assert exc.rule == "CG001"
+        assert exc.node_kind == "ast.Lambda"
+        assert exc.allowlist_member == "any of NODE_TYPE_ALLOWLIST per D1 §3.2"
+        assert exc.tracking_url == "https://example/issues/pine-codegen"
+
+    def test_default_str_renders_rule_kind_member(self) -> None:
+        from openbb_pine.errors import PineCodegenError
+
+        exc = PineCodegenError(
+            rule="CG002",
+            node_kind="ImportFrom('os')",
+            allowlist_member="any of MODULE_ALLOWLIST",
+        )
+        s = str(exc)
+        assert "CG002" in s
+        assert "ImportFrom('os')" in s
+        assert "MODULE_ALLOWLIST" in s
+
+    def test_default_str_includes_tracking_url(self) -> None:
+        from openbb_pine.errors import PineCodegenError
+
+        exc = PineCodegenError(
+            rule="CG003",
+            node_kind="Name('__import__')",
+            tracking_url="https://example/tracking",
+        )
+        assert "https://example/tracking" in str(exc)
+
+    def test_backward_compat_message_kwarg(self) -> None:
+        from openbb_pine.errors import PineCodegenError
+
+        exc = PineCodegenError(message="raw pre-stitched error text")
+        assert str(exc) == "raw pre-stitched error text"
+        # Structured attrs default to None.
+        assert exc.rule is None
+        assert exc.node_kind is None
+        assert exc.allowlist_member is None
+
+    def test_backward_compat_positional_string_still_works(self) -> None:
+        """Pre-existing call sites (defensive raises that don't yet thread
+        structured fields) must keep working with a positional string."""
+        from openbb_pine.errors import PineCodegenError
+
+        exc = PineCodegenError("codegen emitted disallowed ast.Lambda")
+        assert str(exc) == "codegen emitted disallowed ast.Lambda"
+        assert exc.rule is None
+
+    def test_no_args_yields_generic_text(self) -> None:
+        from openbb_pine.errors import PineCodegenError
+
+        exc = PineCodegenError()
+        # Even with no fields, str() doesn't crash and produces some text.
+        assert isinstance(str(exc), str)
+        assert len(str(exc)) > 0
+
+    def test_subclass_of_pinecompileerror(self) -> None:
+        """The diagnostic-shape class hierarchy moves PineCodegenError under
+        PineCompileError so existing ``except PineCompileError`` handlers
+        catch CG### uniformly with PT###."""
+        from openbb_pine.errors import PineCompileError, PineCodegenError
+
+        assert issubclass(PineCodegenError, PineCompileError)
+
+    def test_class_code_attr_unchanged(self) -> None:
+        from openbb_pine.errors import PineCodegenError
+
+        assert PineCodegenError.code == "PineCodegenError"
+
+    def test_tracking_url_instance_shadows_class_default(self) -> None:
+        """The PineError class-level ``tracking_url`` is None. Per-instance
+        override must be visible on the exception instance (so D3 §4.1
+        renders it into the REST envelope) without mutating the class."""
+        from openbb_pine.errors import PineCodegenError
+
+        exc = PineCodegenError(
+            rule="CG001",
+            node_kind="ast.Exec",
+            tracking_url="https://my/tracking",
+        )
+        assert exc.tracking_url == "https://my/tracking"
+        # Class default should still be None.
+        assert PineCodegenError.tracking_url is None
+
+
+# ---------------------------------------------------------------------------
 # Existing raise sites — backward compatibility smoke test
 # ---------------------------------------------------------------------------
 
