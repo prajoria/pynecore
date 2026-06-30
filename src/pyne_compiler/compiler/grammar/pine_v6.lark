@@ -1,0 +1,262 @@
+// Pine Script v6 grammar (D1 §1.3, §1.5)
+//
+// Earley grammar. The standard lexer is BYPASSED — every terminal here is
+// %declare'd and fed by openbb_pine.compiler.parser._TokenFeederLexer, which
+// adapts the C1 hand-rolled lexer's Token stream into lark Tokens. Pine
+// keywords come from the lexer as NAME tokens; the adapter reclassifies
+// keyword names (if, else, for, ...) into dedicated terminals so this
+// grammar can branch cleanly.
+//
+// Operator-precedence is encoded by grammar layer (lowest precedence at the
+// top, tightest at the bottom). Earley is content to flag genuine
+// ambiguities at grammar-development time (D1 §1.3 — `f(x)[1]` etc.).
+//
+// All grammar rules construct a tree node consumed by `_IRBuilder`
+// (a lark Transformer subclass) — one method per rule, mechanical
+// translation to the IR dataclasses from openbb_pine.compiler.ir.
+
+// ===== Terminals (declared; fed by _TokenFeederLexer) ==============
+
+%declare AT_VERSION
+%declare NEWLINE
+%declare INDENT
+%declare DEDENT
+%declare EOF
+
+// Literals
+%declare NUMBER
+%declare STRING
+
+// Identifiers & keyword tokens (reclassified from NAME by the adapter).
+%declare NAME
+
+// Pine reserved keywords (carved out of NAME)
+%declare KW_INDICATOR
+%declare KW_STRATEGY
+%declare KW_LIBRARY
+%declare KW_IF
+%declare KW_ELSE
+%declare KW_FOR
+%declare KW_TO
+%declare KW_BY
+%declare KW_IN
+%declare KW_WHILE
+%declare KW_SWITCH
+%declare KW_VAR
+%declare KW_VARIP
+%declare KW_TRUE
+%declare KW_FALSE
+%declare KW_NA
+%declare KW_AND
+%declare KW_OR
+%declare KW_NOT
+%declare KW_METHOD
+%declare KW_ENUM
+%declare KW_TYPE
+%declare KW_IMPORT
+%declare KW_EXPORT
+%declare KW_RETURN
+%declare KW_CONTINUE
+%declare KW_BREAK
+// Pine type-qualifier keywords aren't reserved — they live in NAME and
+// are recognised by the IR builder when they appear in qualifier position.
+
+// Punctuation
+%declare LPAREN RPAREN
+%declare LBRACKET RBRACKET
+%declare LBRACE RBRACE
+%declare COMMA SEMICOLON DOT COLON QMARK
+
+// Operators
+%declare ASSIGN          // =
+%declare WALRUS          // :=
+%declare ARROW           // =>
+%declare OP_EQ OP_NEQ
+%declare OP_LT OP_LE OP_GT OP_GE
+%declare OP_PLUS OP_MINUS OP_STAR OP_SLASH OP_PERCENT
+
+// ===== Top-level program ===========================================
+
+start: program
+
+// The C1 lexer consumes the trailing newline of the //@version= pragma
+// internally, so no NEWLINE follows AT_VERSION at this layer.
+program: AT_VERSION? top_item* EOF
+
+// A "top item" is one logical line at module scope: a script directive,
+// a declaration, or a body statement. NEWLINEs at module scope are
+// absorbed so blank lines don't matter.
+top_item: NEWLINE
+        | script_directive NEWLINE
+        | declaration
+        | statement
+
+// ----- Script directives -----
+
+script_directive: indicator_directive
+                | strategy_directive
+                | library_directive
+
+indicator_directive: KW_INDICATOR LPAREN call_args RPAREN
+strategy_directive:  KW_STRATEGY  LPAREN call_args RPAREN
+// Library bodies are a Phase 2+ concern (D1 — strategy/library bodies stubbed).
+library_directive:   KW_LIBRARY   LPAREN call_args RPAREN
+
+// ===== Declarations ================================================
+
+declaration: function_decl
+           | type_decl
+           | enum_decl
+
+function_decl: method_modifier? NAME LPAREN parameters? RPAREN ARROW NEWLINE block
+             | method_modifier? NAME LPAREN parameters? RPAREN ARROW expression NEWLINE
+             | method_modifier? NAME LPAREN parameters? RPAREN ASSIGN expression NEWLINE
+             | method_modifier? NAME LPAREN parameters? RPAREN ASSIGN NEWLINE block
+
+method_modifier: KW_METHOD
+
+parameters: parameter (COMMA parameter)*
+parameter:  NAME (ASSIGN expression)?
+
+// type_decl: ``type Foo`` UDT — body indented field block.
+type_decl: KW_TYPE NAME (KW_EXPORT)? NEWLINE INDENT type_field+ DEDENT
+type_field: type_annotation? NAME (ASSIGN expression)? NEWLINE
+
+// enum_decl: v6 ``enum Foo`` — indented member list (each member optional value).
+enum_decl: KW_ENUM NAME NEWLINE INDENT enum_member+ DEDENT
+enum_member: NAME (ASSIGN expression)? NEWLINE
+
+// ===== Statements ==================================================
+
+statement: simple_stmt
+         | compound_stmt
+         | NEWLINE                          // blank lines inside blocks
+
+simple_stmt: simple_stmt_body (SEMICOLON simple_stmt_body)* NEWLINE
+
+simple_stmt_body: var_decl
+               | assignment
+               | return_stmt
+               | break_stmt
+               | continue_stmt
+               | expr_stmt
+
+compound_stmt: if_stmt
+             | for_stmt
+             | for_in_stmt
+             | while_stmt
+             | switch_stmt
+
+// ----- Simple statements -----
+
+var_decl: var_qualifier NAME ASSIGN expression
+        | var_qualifier type_annotation NAME ASSIGN expression
+
+var_qualifier: KW_VAR | KW_VARIP
+
+assignment: assign_target ASSIGN expression       -> assignment_eq
+          | assign_target WALRUS expression        -> assignment_walrus
+
+assign_target: NAME (attribute_tail | subscript_tail)*
+             | tuple_target
+
+tuple_target: LBRACKET NAME (COMMA NAME)+ RBRACKET
+
+return_stmt: KW_RETURN expression?
+break_stmt:    KW_BREAK
+continue_stmt: KW_CONTINUE
+
+expr_stmt: expression
+
+// ----- Compound statements -----
+
+if_stmt: KW_IF expression NEWLINE block (KW_ELSE KW_IF expression NEWLINE block)* (KW_ELSE NEWLINE block)?
+
+for_stmt: KW_FOR NAME ASSIGN expression KW_TO expression (KW_BY expression)? NEWLINE block
+
+for_in_stmt: KW_FOR NAME KW_IN expression NEWLINE block
+           | KW_FOR LBRACKET NAME COMMA NAME RBRACKET KW_IN expression NEWLINE block
+
+while_stmt: KW_WHILE expression NEWLINE block
+
+switch_stmt: KW_SWITCH expression? NEWLINE INDENT switch_case+ DEDENT
+switch_case: expression ARROW (block | expression NEWLINE)
+           | ARROW (block | expression NEWLINE)                  -> switch_default
+
+// ----- Block (indented body) -----
+
+block: INDENT statement+ DEDENT
+     | simple_stmt                       // one-line body: `if x\n  y = 1` vs `if x => y`
+
+// ===== Expressions (precedence: lowest to highest) =================
+// D1 §1.3: operator precedence encoded by grammar levels (the Earley win).
+
+// 1. Ternary  (lowest binding)
+expression: ternary
+
+ternary: bool_or (QMARK expression COLON expression)?
+
+// 2. Logical OR
+bool_or: bool_and (KW_OR bool_and)*
+
+// 3. Logical AND
+bool_and: bool_not (KW_AND bool_not)*
+
+// 4. Logical NOT (unary)
+bool_not: KW_NOT bool_not -> not_expr
+        | comparison
+
+// 5. Equality + relational
+comparison: additive (comparison_op additive)*
+comparison_op: OP_EQ | OP_NEQ | OP_LT | OP_LE | OP_GT | OP_GE
+
+// 6. Additive
+additive: multiplicative (add_op multiplicative)*
+add_op: OP_PLUS | OP_MINUS
+
+// 7. Multiplicative
+multiplicative: unary (mul_op unary)*
+mul_op: OP_STAR | OP_SLASH | OP_PERCENT
+
+// 8. Unary sign
+unary: OP_MINUS unary -> unary_minus
+     | OP_PLUS  unary -> unary_plus
+     | postfix
+
+// 9. Postfix chain — function calls, attribute access, subscript / history `[n]`
+postfix: primary postfix_tail*
+
+postfix_tail: call_tail
+            | attribute_tail
+            | subscript_tail
+
+call_tail:      LPAREN call_args? RPAREN
+attribute_tail: DOT NAME
+subscript_tail: LBRACKET expression RBRACKET
+
+call_args: call_arg (COMMA call_arg)*
+call_arg:  NAME ASSIGN expression -> kwarg
+        |  expression              -> posarg
+
+// 10. Primary
+primary: literal
+       | NAME                              -> name_expr
+       | LPAREN expression RPAREN          -> paren_expr
+       | tuple_literal
+
+tuple_literal: LBRACKET expression (COMMA expression)+ RBRACKET
+
+literal: NUMBER       -> number_literal
+       | STRING       -> string_literal
+       | KW_TRUE      -> true_literal
+       | KW_FALSE     -> false_literal
+       | KW_NA        -> na_literal
+
+// ===== Type annotations ============================================
+// Pine: ``[qualifier] inner_type`` e.g. `simple int`, `series float`,
+// `array<float>`. Used in parameter / var declarations.
+
+type_annotation: qualifier? type_inner
+qualifier: NAME
+type_inner: NAME (OP_LT type_arg_list OP_GT)?
+type_arg_list: type_annotation (COMMA type_annotation)*
