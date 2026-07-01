@@ -106,7 +106,7 @@ BUILTIN_SIGNATURES: dict[str, Signature] = {
     "ta.wma":        Signature(args=_src_length(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
     "ta.vwma":       Signature(args=_src_length(), returns=_SERIES_FLOAT),
     "ta.swma":       Signature(args=(("src", _SERIES_FLOAT),), returns=_SERIES_FLOAT),
-    "ta.rsi":        Signature(args=_src_length(), returns=_SERIES_FLOAT),
+    "ta.rsi":        Signature(args=_src_length(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
     # MACD returns a 3-tuple ``(macd_line, signal_line, hist)``. Wave 5B-1
     # lifted the stub to its real tuple shape; C3's tuple-destructuring path
     # (type_checker._visit_subscript / assignment tuple unpack) reads
@@ -141,32 +141,50 @@ BUILTIN_SIGNATURES: dict[str, Signature] = {
             ("length", _SIMPLE_INT),
         ),
         returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
     ),
-    "ta.cci":        Signature(args=_src_length(), returns=_SERIES_FLOAT),
-    "ta.mfi":        Signature(args=_src_length(), returns=_SERIES_FLOAT),
+    "ta.cci":        Signature(args=_src_length(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
+    "ta.mfi":        Signature(args=_src_length(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
+    # ta.adx is NOT in the PRD §3.2 Phase-1 list — Wave 5B-2 (bead 0e9.5.26)
+    # added its registry entry alongside the bridge because PyneCore has no
+    # standalone ``adx`` primitive; the bridge synthesises it from
+    # ``ta.dmi(dilen, adxlen)[2]``. Signature deviation from most ta.*: no
+    # ``src`` parameter — Pine's ``ta.adx`` takes only the two length
+    # parameters and reads ``high``/``low`` off the primary OHLCV stream
+    # transitively through ``ta.dmi``.
+    "ta.adx":        Signature(
+        args=(
+            ("dilen", _SIMPLE_INT),
+            ("adxlen", _SIMPLE_INT),
+        ),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
     "ta.atr":        Signature(args=(("length", _SIMPLE_INT),), returns=_SERIES_FLOAT),
     "ta.tr":         Signature(args=(("handle_na", _SIMPLE_BOOL),), returns=_SERIES_FLOAT),
     "ta.stdev":      Signature(args=_src_length(), returns=_SERIES_FLOAT),
     "ta.variance":   Signature(args=_src_length(), returns=_SERIES_FLOAT),
-    "ta.highest":    Signature(args=_src_length(), returns=_SERIES_FLOAT),
-    "ta.lowest":     Signature(args=_src_length(), returns=_SERIES_FLOAT),
-    "ta.barssince":  Signature(args=(("cond", _SERIES_BOOL),), returns=_SERIES_INT),
+    "ta.highest":    Signature(args=_src_length(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
+    "ta.lowest":     Signature(args=_src_length(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
+    "ta.barssince":  Signature(args=(("cond", _SERIES_BOOL),), returns=_SERIES_INT, notes="IMPLEMENTED"),
     "ta.crossover":  Signature(
         args=(("source1", _SERIES_FLOAT), ("source2", _SERIES_FLOAT)),
         returns=_SERIES_BOOL,
+        notes="IMPLEMENTED",
     ),
     "ta.crossunder": Signature(
         args=(("source1", _SERIES_FLOAT), ("source2", _SERIES_FLOAT)),
         returns=_SERIES_BOOL,
+        notes="IMPLEMENTED",
     ),
     "ta.cross":      Signature(
         args=(("source1", _SERIES_FLOAT), ("source2", _SERIES_FLOAT)),
         returns=_SERIES_BOOL,
     ),
-    "ta.change":     Signature(args=(("src", _SERIES_FLOAT),), returns=_SERIES_FLOAT),
-    "ta.mom":        Signature(args=_src_length(), returns=_SERIES_FLOAT),
-    "ta.roc":        Signature(args=_src_length(), returns=_SERIES_FLOAT),
-    "ta.cum":        Signature(args=(("src", _SERIES_FLOAT),), returns=_SERIES_FLOAT),
+    "ta.change":     Signature(args=(("src", _SERIES_FLOAT),), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
+    "ta.mom":        Signature(args=_src_length(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
+    "ta.roc":        Signature(args=_src_length(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
+    "ta.cum":        Signature(args=(("src", _SERIES_FLOAT),), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
     "ta.dev":        Signature(args=_src_length(), returns=_SERIES_FLOAT),
     "ta.linreg":     Signature(
         args=(
@@ -175,8 +193,21 @@ BUILTIN_SIGNATURES: dict[str, Signature] = {
             ("offset", _SIMPLE_INT),
         ),
         returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
     ),
-    "ta.median":     Signature(args=_src_length(), returns=_SERIES_FLOAT),
+    "ta.median":     Signature(args=_src_length(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
+    # ta.percentile_linear_interpolation — Wave 5B-4 (bead 0e9.5.42). Percentile
+    # with linear interpolation between adjacent ranks. Pine signature:
+    # (source, length, percentage) where percentage is 0..100.
+    "ta.percentile_linear_interpolation": Signature(
+        args=(
+            ("source", _SERIES_FLOAT),
+            ("length", _SIMPLE_INT),
+            ("percentage", _SIMPLE_FLOAT),
+        ),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
     # === math.* builtins per PRD §3.2 ============================================
     # Bridges landed in Wave 5B group 5 (S-beads 0e9.5.{45..51}).
     # ``math.max`` / ``math.min`` are declared as 2-ary here for C3's stub
