@@ -299,6 +299,9 @@ def detect_pine_version(source: str) -> int:
     if version in (5, 6):
         return version
     if version < 5:
+        from openbb_pine.telemetry import record_unsupported_feature
+
+        record_unsupported_feature("PF001")
         raise PineUnsupportedFeatureError(
             message=(
                 f"PF001 Pine v{version} is not supported. The migration shim "
@@ -307,6 +310,9 @@ def detect_pine_version(source: str) -> int:
                 f"specific v{version} script be re-evaluated."
             )
         )
+    from openbb_pine.telemetry import record_unsupported_feature
+
+    record_unsupported_feature("PF002")
     raise PineUnsupportedFeatureError(
         message=(
             f"PF002 Pine v{version} pragma found, but the compiler targets "
@@ -425,6 +431,9 @@ def migrate_v5_to_v6(source: str) -> tuple[str, list[str]]:
     scan_target = _strip_line_comments(out)
     for unhandled_pat, feature in _UNHANDLED_V5_PATTERNS:
         if unhandled_pat.search(scan_target):
+            from openbb_pine.telemetry import record_unsupported_feature
+
+            record_unsupported_feature("PF003")
             raise PineUnsupportedFeatureError(
                 message=(
                     f"PF003 v5 {feature} not yet migrated to v6: the regex "

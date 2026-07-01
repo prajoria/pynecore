@@ -202,6 +202,11 @@ class _TypeChecker:
         """Collect-then-raise: ensure the name lands in builtins_used before
         the exception unwinds, so an outer catch sees the partial coverage."""
         self._builtins_used.add(name)
+        # PRD §3.4 L0.5 wild-corpus attribution: record BEFORE raising so
+        # the counter is accurate even when an outer ``except`` swallows.
+        from openbb_pine.telemetry import record_unsupported_builtin
+
+        record_unsupported_builtin(name)
         exc = PineUnsupportedBuiltinError(
             name,
             suggested_alternative=hint,
@@ -308,6 +313,9 @@ class _TypeChecker:
     def _visit_var_decl(self, stmt: ir.VarDecl) -> ir.VarDecl:
         # PF002 — typed decls in body deferred per bead spec.
         if stmt.type is not None:
+            from openbb_pine.telemetry import record_unsupported_feature
+
+            record_unsupported_feature("PF002")
             raise PineUnsupportedFeatureError(
                 "PF002 typed decl in body",
                 tracking_url=(
