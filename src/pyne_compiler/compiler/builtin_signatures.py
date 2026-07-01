@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from openbb_pine.compiler.types import PineType, Scalar
+from openbb_pine.compiler.types import PineType, Scalar, TupleT
 
 __all__ = [
     "Signature",
@@ -100,15 +100,17 @@ def _src_length() -> tuple[tuple[str, PineType], ...]:
 
 BUILTIN_SIGNATURES: dict[str, Signature] = {
     # === 29 ta.* builtins per PRD §3.2 ===========================================
-    "ta.sma":        Signature(args=_src_length(), returns=_SERIES_FLOAT),
-    "ta.ema":        Signature(args=_src_length(), returns=_SERIES_FLOAT),
-    "ta.rma":        Signature(args=_src_length(), returns=_SERIES_FLOAT),
-    "ta.wma":        Signature(args=_src_length(), returns=_SERIES_FLOAT),
+    "ta.sma":        Signature(args=_src_length(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
+    "ta.ema":        Signature(args=_src_length(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
+    "ta.rma":        Signature(args=_src_length(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
+    "ta.wma":        Signature(args=_src_length(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
     "ta.vwma":       Signature(args=_src_length(), returns=_SERIES_FLOAT),
     "ta.swma":       Signature(args=(("src", _SERIES_FLOAT),), returns=_SERIES_FLOAT),
     "ta.rsi":        Signature(args=_src_length(), returns=_SERIES_FLOAT),
-    # MACD returns a 3-tuple (line, signal, hist) — TupleT in real life; the
-    # stub returns series<float> until the S-bead lands the tuple shape.
+    # MACD returns a 3-tuple ``(macd_line, signal_line, hist)``. Wave 5B-1
+    # lifted the stub to its real tuple shape; C3's tuple-destructuring path
+    # (type_checker._visit_subscript / assignment tuple unpack) reads
+    # TupleT.elements to route each element to its LHS binding.
     "ta.macd":       Signature(
         args=(
             ("src", _SERIES_FLOAT),
@@ -116,7 +118,11 @@ BUILTIN_SIGNATURES: dict[str, Signature] = {
             ("slowlen", _SIMPLE_INT),
             ("siglen", _SIMPLE_INT),
         ),
-        returns=_SERIES_FLOAT,
+        returns=PineType(
+            qualifier="series",
+            inner=TupleT(elements=(_SERIES_FLOAT, _SERIES_FLOAT, _SERIES_FLOAT)),
+        ),
+        notes="IMPLEMENTED",
     ),
     # Bollinger Bands also returns a tuple; stub returns scalar series.
     "ta.bb":         Signature(
