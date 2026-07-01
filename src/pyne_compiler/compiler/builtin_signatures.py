@@ -124,14 +124,21 @@ BUILTIN_SIGNATURES: dict[str, Signature] = {
         ),
         notes="IMPLEMENTED",
     ),
-    # Bollinger Bands also returns a tuple; stub returns scalar series.
+    # Bollinger Bands returns a 3-tuple ``(basis, upper, lower)``. Wave 5B-3
+    # (bead 0e9.5.22) lifted the stub to its real tuple shape; same pattern
+    # as Wave 5B-1's ``ta.macd`` — C3's tuple-destructuring path reads
+    # TupleT.elements to route each element to its LHS binding.
     "ta.bb":         Signature(
         args=(
             ("src", _SERIES_FLOAT),
             ("length", _SIMPLE_INT),
             ("mult", _SIMPLE_FLOAT),
         ),
-        returns=_SERIES_FLOAT,
+        returns=PineType(
+            qualifier="series",
+            inner=TupleT(elements=(_SERIES_FLOAT, _SERIES_FLOAT, _SERIES_FLOAT)),
+        ),
+        notes="IMPLEMENTED",
     ),
     "ta.stoch":      Signature(
         args=(
@@ -160,19 +167,109 @@ BUILTIN_SIGNATURES: dict[str, Signature] = {
         returns=_SERIES_FLOAT,
         notes="IMPLEMENTED",
     ),
-    "ta.atr":        Signature(args=(("length", _SIMPLE_INT),), returns=_SERIES_FLOAT),
-    "ta.tr":         Signature(args=(("handle_na", _SIMPLE_BOOL),), returns=_SERIES_FLOAT),
-    "ta.stdev":      Signature(args=_src_length(), returns=_SERIES_FLOAT),
+    "ta.atr":        Signature(
+        # Wave 5B-3 (bead 0e9.5.23). Signature deviation from most ta.*:
+        # NO ``src`` parameter — ``ta.atr`` reads ``high``/``low``/``close``
+        # transitively through ``ta.tr`` and applies Wilder's ``rma`` on top.
+        args=(("length", _SIMPLE_INT),),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
+    "ta.tr":         Signature(
+        # Wave 5B-3 (bead 0e9.5.38). PyneCore models ``tr`` as a
+        # ``@module_property`` so both ``ta.tr`` (bare identifier) and
+        # ``ta.tr(handle_na)`` compile. Registry declares the callable
+        # form with ``handle_na=False`` — the default matches PyneCore.
+        args=(("handle_na", _SIMPLE_BOOL),),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
+    "ta.stdev":      Signature(
+        # Wave 5B-3 (bead 0e9.5.34). Adds the third ``biased`` parameter
+        # matching PyneCore's ``stdev(source, length, biased=True)``. The
+        # ``biased=True`` default (population stdev) matches Pine's
+        # documented behaviour; callers who want the sample form pass
+        # ``biased=False``.
+        args=(("src", _SERIES_FLOAT), ("length", _SIMPLE_INT), ("biased", _SIMPLE_BOOL)),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
     "ta.variance":   Signature(args=_src_length(), returns=_SERIES_FLOAT),
-    "ta.highest":    Signature(args=_src_length(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
-    "ta.lowest":     Signature(args=_src_length(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
-    "ta.barssince":  Signature(args=(("cond", _SERIES_BOOL),), returns=_SERIES_INT, notes="IMPLEMENTED"),
+    # ta.obv is NOT in the PRD §3.2 Phase-1 list — Wave 5B-3 (bead 0e9.5.28)
+    # added its registry entry alongside the bridge because PyneCore models
+    # ``obv`` as a zero-arg ``@module_property`` (Pine scripts write
+    # ``plot(ta.obv)`` — a bare identifier). Registry declares the callable
+    # form ``args=()`` matching how the bridge is invoked.
+    "ta.obv":        Signature(
+        args=(),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
+    # ta.vwap is NOT in the PRD §3.2 Phase-1 list — Wave 5B-3 (bead 0e9.5.29)
+    # added its registry entry alongside the bridge. PyneCore's public
+    # signature is ``vwap(source, anchor=None, stdev_mult=None)``; the
+    # scalar return-type covers the vast majority of Pine calls
+    # (``ta.vwap(hlc3)``, ``ta.vwap(close)``). A future stub lift can add
+    # the tuple return for the ``stdev_mult`` overload without a bridge
+    # change — the bridge already accepts and forwards ``stdev_mult``.
+    "ta.vwap":       Signature(
+        args=(
+            ("source", _SERIES_FLOAT),
+            ("anchor", _SIMPLE_BOOL),
+            ("stdev_mult", _SIMPLE_FLOAT),
+        ),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
+    # ta.sar is NOT in the PRD §3.2 Phase-1 list — Wave 5B-3 (bead 0e9.5.39)
+    # added its registry entry alongside the bridge. Signature deviation
+    # from most ta.*: no ``src`` — ``ta.sar`` reads ``high``/``low`` off
+    # the primary OHLCV stream. The parameter named ``max`` shadows
+    # Python's builtin — preserved to match PyneCore's public signature
+    # so keyword-form calls resolve.
+    "ta.sar":        Signature(
+        args=(
+            ("start", _SIMPLE_FLOAT),
+            ("inc", _SIMPLE_FLOAT),
+            ("max", _SIMPLE_FLOAT),
+        ),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
+    "ta.highest":    Signature(
+        # Wave 5B-4 (bead 0e9.5.32). Bridge lives at openbb_pine.stdlib.ta.highest.
+        # PyneCore names the first arg ``source``; the registry mirrors that
+        # so keyword-form Pine calls resolve. PyneCore also defines a
+        # single-arg overload ``ta.highest(length)`` (defaults source to
+        # ``high``); Phase-1 stub covers the two-arg form only — codegen's
+        # arg-fill handles the sugar form in a later phase.
+        args=(("source", _SERIES_FLOAT), ("length", _SIMPLE_INT)),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
+    "ta.lowest":     Signature(
+        # Wave 5B-4 (bead 0e9.5.33). Symmetric to ``ta.highest``.
+        args=(("source", _SERIES_FLOAT), ("length", _SIMPLE_INT)),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
+    "ta.barssince":  Signature(
+        # Wave 5B-4 (bead 0e9.5.44). PyneCore param name is ``condition``
+        # (the previous stub used ``cond``); flipping to the PyneCore name
+        # so keyword-form calls resolve through the bridge.
+        args=(("condition", _SERIES_BOOL),),
+        returns=_SERIES_INT,
+        notes="IMPLEMENTED",
+    ),
     "ta.crossover":  Signature(
+        # Wave 5B-4 (bead 0e9.5.30). PyneCore uses ``source1``/``source2``;
+        # the registry preserves the existing names (no drift).
         args=(("source1", _SERIES_FLOAT), ("source2", _SERIES_FLOAT)),
         returns=_SERIES_BOOL,
         notes="IMPLEMENTED",
     ),
     "ta.crossunder": Signature(
+        # Wave 5B-4 (bead 0e9.5.31). Symmetric to ``ta.crossover``.
         args=(("source1", _SERIES_FLOAT), ("source2", _SERIES_FLOAT)),
         returns=_SERIES_BOOL,
         notes="IMPLEMENTED",
@@ -181,24 +278,72 @@ BUILTIN_SIGNATURES: dict[str, Signature] = {
         args=(("source1", _SERIES_FLOAT), ("source2", _SERIES_FLOAT)),
         returns=_SERIES_BOOL,
     ),
-    "ta.change":     Signature(args=(("src", _SERIES_FLOAT),), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
-    "ta.mom":        Signature(args=_src_length(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
-    "ta.roc":        Signature(args=_src_length(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
-    "ta.cum":        Signature(args=(("src", _SERIES_FLOAT),), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
+    "ta.change":     Signature(
+        # Wave 5B-4 (bead 0e9.5.35). PyneCore's public signature is
+        # ``change(source, length=1)``; the stub had only ``src`` (missing
+        # the trailing ``length``). Registry does not model per-arg
+        # defaults — the ``length=1`` default lives in the bridge; C3's
+        # stub type check tolerates the omitted trailing positional. Param
+        # name flipped ``src`` → ``source`` for keyword-form calls.
+        args=(("source", _SERIES_FLOAT), ("length", _SIMPLE_INT)),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
+    "ta.mom":        Signature(
+        # Wave 5B-4 (bead 0e9.5.36). Semantically identical to
+        # ``ta.change(source, length)`` — PyneCore's ``ta.mom`` is a one-line
+        # delegation to ``ta.change``. Param name flipped ``src`` →
+        # ``source`` for PyneCore-native keyword-form calls.
+        args=(("source", _SERIES_FLOAT), ("length", _SIMPLE_INT)),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
+    "ta.roc":        Signature(
+        # Wave 5B-4 (bead 0e9.5.37). Rate of change:
+        # ``100 * (source - source[length]) / source[length]``. Param name
+        # flipped ``src`` → ``source``.
+        args=(("source", _SERIES_FLOAT), ("length", _SIMPLE_INT)),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
+    "ta.cum":        Signature(
+        # Wave 5B-4 (bead 0e9.5.43). No ``length`` arg; running total from
+        # series start. Param name flipped ``src`` → ``source`` to match
+        # PyneCore.
+        args=(("source", _SERIES_FLOAT),),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
     "ta.dev":        Signature(args=_src_length(), returns=_SERIES_FLOAT),
     "ta.linreg":     Signature(
+        # Wave 5B-4 (bead 0e9.5.40). ``offset`` is REQUIRED (no default) in
+        # both PyneCore and the Pine reference — the common
+        # "current-bar value" call is ``ta.linreg(source, length, 0)``. Param
+        # name flipped ``src`` → ``source`` for PyneCore-native keyword-form
+        # calls.
         args=(
-            ("src", _SERIES_FLOAT),
+            ("source", _SERIES_FLOAT),
             ("length", _SIMPLE_INT),
             ("offset", _SIMPLE_INT),
         ),
         returns=_SERIES_FLOAT,
         notes="IMPLEMENTED",
     ),
-    "ta.median":     Signature(args=_src_length(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
+    "ta.median":     Signature(
+        # Wave 5B-4 (bead 0e9.5.41). Rolling median via PyneCore's two-heap
+        # implementation. ``length == 1`` is a short-circuit that returns
+        # ``source`` unchanged.
+        args=(("source", _SERIES_FLOAT), ("length", _SIMPLE_INT)),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
     # ta.percentile_linear_interpolation — Wave 5B-4 (bead 0e9.5.42). Percentile
     # with linear interpolation between adjacent ranks. Pine signature:
-    # (source, length, percentage) where percentage is 0..100.
+    # (source, length, percentage) where percentage is 0..100. This builtin
+    # was NOT in the PRD §3.2 Phase-1 enumeration; Wave 5B-4 adds the entry
+    # alongside the bridge because the parent bead spec 0e9.5.42 names it
+    # explicitly. Third arg is ``percentage`` (NOT ``percentile``) per
+    # PyneCore.
     "ta.percentile_linear_interpolation": Signature(
         args=(
             ("source", _SERIES_FLOAT),
