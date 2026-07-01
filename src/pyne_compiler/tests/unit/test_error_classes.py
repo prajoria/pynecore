@@ -324,6 +324,95 @@ class TestPineCodegenErrorStructuredInit:
 
 
 # ---------------------------------------------------------------------------
+# PineCacheError
+# ---------------------------------------------------------------------------
+
+
+class TestPineCacheErrorStructuredInit:
+    """Mirror of the PineCodegenError tests for the C6 compile-cache error.
+
+    Added as a preempt fix (same shape as the post-R2/R6/Wave-3A/Wave-4
+    pattern) so the C6 cache_read / cache_write atomicity failures raise
+    with structured attrs the REST envelope (D3 §4.1) renders as PRD §4.8
+    JSON. Corruption is deliberately NOT surfaced through this exception
+    (compile_cache logs + degrades to miss instead); this exception exists
+    for atomicity + write-side failures where propagation is preferable.
+    """
+
+    def test_structured_init_populates_all_attrs(self) -> None:
+        from pathlib import Path
+
+        from openbb_pine.errors import PineCacheError
+
+        p = Path("/tmp/pine_cache/ab/abcdef.py")
+        exc = PineCacheError(
+            sha="abcdef1234567890" * 4,  # 64 hex chars
+            defect="os.replace failed",
+            path=p,
+        )
+        assert exc.sha == "abcdef1234567890" * 4
+        assert exc.defect == "os.replace failed"
+        assert exc.path == p
+
+    def test_default_str_renders_sha_defect_path(self) -> None:
+        from pathlib import Path
+
+        from openbb_pine.errors import PineCacheError
+
+        p = Path("/var/tmp/pine_cache/ff/ffee.py")
+        exc = PineCacheError(
+            sha="ffee" * 16,
+            defect="meta.json parse failed",
+            path=p,
+        )
+        s = str(exc)
+        # sha rendered truncated (first 12 chars) for readability.
+        assert "ffeeffeeffee" in s
+        assert "meta.json parse failed" in s
+        assert str(p) in s
+
+    def test_backward_compat_message_kwarg(self) -> None:
+        from openbb_pine.errors import PineCacheError
+
+        exc = PineCacheError(message="raw pre-stitched cache error")
+        assert str(exc) == "raw pre-stitched cache error"
+        # Structured attrs default to None.
+        assert exc.sha is None
+        assert exc.defect is None
+        assert exc.path is None
+
+    def test_backward_compat_positional_string_still_works(self) -> None:
+        """Pre-existing / defensive raises with a positional string keep
+        working (same pattern as PineCodegenError)."""
+        from openbb_pine.errors import PineCacheError
+
+        exc = PineCacheError("could not access cache directory")
+        assert str(exc) == "could not access cache directory"
+        assert exc.sha is None
+
+    def test_no_args_yields_generic_text(self) -> None:
+        from openbb_pine.errors import PineCacheError
+
+        exc = PineCacheError()
+        # Even with no fields, str() doesn't crash and produces some text.
+        assert isinstance(str(exc), str)
+        assert len(str(exc)) > 0
+
+    def test_subclass_of_pineerror(self) -> None:
+        """PineCacheError sits under the PineError root (not PineCompileError)
+        because a cache failure is a different fault domain than a source-side
+        compile error — the D3 §4.1 envelope maps it separately."""
+        from openbb_pine.errors import PineCacheError, PineError
+
+        assert issubclass(PineCacheError, PineError)
+
+    def test_class_code_attr_unchanged(self) -> None:
+        from openbb_pine.errors import PineCacheError
+
+        assert PineCacheError.code == "PineCacheError"
+
+
+# ---------------------------------------------------------------------------
 # Existing raise sites — backward compatibility smoke test
 # ---------------------------------------------------------------------------
 
