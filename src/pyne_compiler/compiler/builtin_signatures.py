@@ -177,22 +177,53 @@ BUILTIN_SIGNATURES: dict[str, Signature] = {
         returns=_SERIES_FLOAT,
     ),
     "ta.median":     Signature(args=_src_length(), returns=_SERIES_FLOAT),
-    # === 7 math.* builtins per PRD §3.2 ==========================================
-    "math.abs":      Signature(args=(("number", _SERIES_FLOAT),), returns=_SERIES_FLOAT),
-    "math.sqrt":     Signature(args=(("number", _SERIES_FLOAT),), returns=_SERIES_FLOAT),
+    # === math.* builtins per PRD §3.2 ============================================
+    # Bridges landed in Wave 5B group 5 (S-beads 0e9.5.{45..51}).
+    # ``math.max`` / ``math.min`` are declared as 2-ary here for C3's stub
+    # type check; PyneCore (and the bridge) accept N-ary via ``*numbers``,
+    # and C3 tolerates trailing positionals when checking against a stub
+    # (see :func:`_check_call_args`).
+    "math.abs":      Signature(
+        args=(("number", _SERIES_FLOAT),),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
+    "math.sqrt":     Signature(
+        args=(("number", _SERIES_FLOAT),),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
     "math.log":      Signature(args=(("number", _SERIES_FLOAT),), returns=_SERIES_FLOAT),
     "math.exp":      Signature(args=(("number", _SERIES_FLOAT),), returns=_SERIES_FLOAT),
     "math.max":      Signature(
         args=(("a", _SERIES_FLOAT), ("b", _SERIES_FLOAT)),
         returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
     ),
     "math.min":      Signature(
         args=(("a", _SERIES_FLOAT), ("b", _SERIES_FLOAT)),
         returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
     ),
     "math.pow":      Signature(
         args=(("base", _SERIES_FLOAT), ("exponent", _SERIES_FLOAT)),
         returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
+    "math.round":    Signature(
+        # ``precision`` is optional; PyneCore treats an omitted precision as
+        # NA(int) (defaulting to integer rounding). The stub declares it as
+        # a normal simple<int> arg; C3's positional-check tolerates the
+        # single-arg call because we do not enforce arity min for the stub.
+        args=(("number", _SERIES_FLOAT), ("precision", _SIMPLE_INT)),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
+    ),
+    "math.sum":      Signature(
+        # Rolling sum over ``length`` bars — same shape as ta.sma/ta.rma.
+        args=(("source", _SERIES_FLOAT), ("length", _SIMPLE_INT)),
+        returns=_SERIES_FLOAT,
+        notes="IMPLEMENTED",
     ),
     # === input.* constructors ====================================================
     "input.int":     Signature(
