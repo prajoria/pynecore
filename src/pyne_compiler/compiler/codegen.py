@@ -3,21 +3,35 @@
 Authoritative source: D1 §3 (codegen contract — read every subsection,
 especially §3.1 CompiledModule, §3.2 allowlists, §3.3 the gate, §3.4 what
 the gate is NOT, §3.5 telemetry); §2.5/§2.6 (IR invariants codegen relies
-on); §6 (compile cache key — C6's territory; we set ``cache_status="bypass"``
-and a placeholder ``sha``).
+on). C6 owns the compile cache (:mod:`openbb_pine.compiler.compile_cache`);
+this module's :func:`emit` returns a ``CompiledModule`` with an EMPTY
+``sha`` and ``cache_status="bypass"``. The :func:`compile_pine` facade
+overwrites both fields when the C6 cache is active.
 
 Public surface
 --------------
 
 * :func:`emit` — ``(typed_program, builtins_used, security_contexts, …)``
   → :class:`CompiledModule`. Pure tree-walk Visitor over the typed IR; no
-  analysis happens here (that's C3's job).
+  analysis happens here (that's C3's job). Cache-agnostic — the returned
+  module carries ``sha=""`` (empty) and ``cache_status="bypass"``.
 * :data:`NODE_TYPE_ALLOWLIST`, :data:`MODULE_ALLOWLIST`,
   :data:`GLOBAL_NAME_ALLOWLIST` — the three frozensets that close the
   T1 mitigation per D1 §3.2.
 * :func:`_enforce_allowlist` — the gate (D1 §3.3). Walks every ``ast.*``
   node and raises :class:`PineCodegenError(CG001/CG002/CG003)` on any
   violation. Runs **before** the source string is built, never after.
+
+Two callers, two states
+-----------------------
+
+* Via :func:`compile_pine` facade (production path): facade overwrites
+  ``sha`` with the C6 cache key and flips ``cache_status`` to
+  ``"hit"`` / ``"miss"`` / ``"bypass"`` per the cache-probe outcome.
+* Direct :func:`emit` call (tests + tooling that hand-construct an IR):
+  ``sha=""`` + ``cache_status="bypass"`` — signalling "no cache
+  key, no cache write". Direct callers who need a cache key can compute
+  one via :func:`compile_cache.make_cache_key` and thread it through.
 
 Output shape (D1 §3.1, verified against
 ``third_party/pynecore/tests/t01_lib/t30_strategy/test_002_bollinger.py``)::
@@ -74,8 +88,9 @@ happen in production; one firing means a compiler bug. The structured
 Out of scope
 ------------
 
-* C6 compile cache (separate bead — ``cache_status="bypass"`` + the
-  ``TODO(C6)`` placeholder ``sha`` is the seam).
+* C6 compile cache is owned by :mod:`openbb_pine.compiler.compile_cache`;
+  this module's ``emit`` sets ``sha=""`` + ``cache_status="bypass"`` and
+  the :func:`compile_pine` facade wires the two together.
 * C8 error-model wiring (separate bead — this only added
   PineCodegenError's structured init).
 * The 36 stdlib bridges (S beads — each one ``.pine`` + ``.csv`` +
@@ -98,7 +113,6 @@ that we never emit and the cache-key metadata we add in the docstring.
 from __future__ import annotations
 
 import ast
-import hashlib
 
 from openbb_pine.compiler import ir
 from openbb_pine.compiler.types import CompiledModule, SecurityContext
@@ -403,6 +417,9 @@ class _CodegenVisitor:
     def visit_Program(self, prog: ir.Program) -> ast.Module:
         # Defer strategy() to M2 per PRD §3.2 (PF010).
         if prog.directive.kind == "strategy":
+            from openbb_pine.telemetry import record_unsupported_feature
+
+            record_unsupported_feature("PF010")
             raise PineUnsupportedFeatureError(
                 "PF010 strategy decl — deferred to M2 (bead 0e9.5.6)",
                 tracking_url=(
@@ -411,6 +428,9 @@ class _CodegenVisitor:
                 ),
             )
         if prog.directive.kind == "library":
+            from openbb_pine.telemetry import record_unsupported_feature
+
+            record_unsupported_feature("PF011")
             raise PineUnsupportedFeatureError(
                 "PF011 library decl — deferred (no Phase-1 use-case)",
                 tracking_url=(
@@ -1093,13 +1113,11 @@ def emit(
        :class:`PineCodegenError` with structured ``rule`` / ``node_kind``.
     3. **Unparse to source** via :func:`ast.unparse` — produces the
        canonical formatted Python text.
-    4. **Hash for the placeholder cache key** (TODO C6 will replace with
-       the real D1 §6 key over ``source ‖ params ‖ compiler_version ‖
-       pine_version``). We use blake2b-128 of the source text so the
-       field is never empty — C6's cache lookup will use its own key.
-    5. **Wrap in CompiledModule** with ``cache_status="bypass"`` so
-       D2's executor doesn't try to read a cache that hasn't been
-       written.
+    4. **Wrap in CompiledModule** with ``sha=""`` + ``cache_status="bypass"``
+       — the :func:`compile_pine` facade overwrites both when the C6 cache
+       is active. Direct callers of :func:`emit` who need a cache key can
+       compute one via :func:`compile_cache.make_cache_key` and thread it
+       through.
 
     Parameters
     ----------
@@ -1122,9 +1140,11 @@ def emit(
     -------
     CompiledModule
         With ``source`` populated (validated by ``compile(...)``-ability
-        in tests), ``sha`` set to a blake2b-128 placeholder,
-        ``cache_status="bypass"``, ``builtins_used`` echoed through,
-        and ``security_contexts`` echoed through (None in Phase 1).
+        in tests), ``sha=""`` (empty — C6's :func:`compile_pine` facade
+        overwrites with the real cache key), ``cache_status="bypass"``
+        (facade overwrites with ``"hit"`` / ``"miss"`` per the cache
+        probe outcome), ``builtins_used`` echoed through, and
+        ``security_contexts`` echoed through (None in Phase 1).
 
     Raises
     ------
@@ -1153,16 +1173,14 @@ def emit(
         1,
     )
 
-    # TODO(C6): real cache key per D1 §6 — blake2b over
-    # source ‖ params ‖ compiler_version ‖ pine_version. The placeholder
-    # below is non-empty (so the CompiledModule shape is honest) but
-    # cache_status="bypass" tells the executor not to trust it for a
-    # lookup. C6 lands the real key + storage layer + lookup logic.
-    sha_placeholder = hashlib.blake2b(source.encode("utf-8"), digest_size=16).hexdigest()
-
+    # sha="" + cache_status="bypass" is the "no cache" seam. The
+    # :func:`compile_pine` facade wraps this call and overwrites both
+    # fields when the C6 cache is active (with the real cache key + the
+    # probe outcome). Direct callers of emit() opt into the "no cache"
+    # contract by using these defaults.
     return CompiledModule(
         source=source,
-        sha=sha_placeholder,
+        sha="",
         pine_version=pine_version,
         compiler_version=compiler_version,
         builtins_used=builtins_used,

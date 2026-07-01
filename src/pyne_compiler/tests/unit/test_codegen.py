@@ -18,8 +18,9 @@ Mirror of D1 §3 — every aspect of the codegen contract is exercised:
 * :class:`TestImportConsolidation` — the ``from pynecore.lib import …``
   line carries exactly the names ``builtins_used`` implies (no more, no
   less).
-* :class:`TestHashAndCacheStatus` — sha is non-empty + deterministic;
-  cache_status is ``"bypass"`` (C6 territory).
+* :class:`TestHashAndCacheStatus` — after C6, sha is the 64-char BLAKE2b
+  cache key; cache_status is ``"miss"`` on first compile via compile_pine
+  (see test_compile_cache.py for full cache coverage).
 
 Allowlist-gate-specific tests live in ``test_codegen_allowlist.py``.
 """
@@ -332,33 +333,69 @@ class TestCompiledModuleContract:
         # Phase 1: C3 always returns None for security_contexts.
         assert compiled.security_contexts is None
 
-    def test_cache_status_is_bypass(self) -> None:
-        """C5 emits cache_status='bypass'; C6 will swap in 'hit'/'miss'."""
-        compiled = _compile(
-            '//@version=6\nindicator("X")\nplot(close)\n'
-        )
-        assert compiled.cache_status == "bypass"
+    def test_cache_status_is_miss_on_first_compile(self) -> None:
+        """After C6 (bead 0e9.5.6), the compile_pine facade wires the cache:
+        first compile of a source is a miss, second is a hit (see
+        test_compile_cache.py). Here we verify only the miss shape, using a
+        tmp cache dir so we don't pollute the operator's real ~/.openbb.
+        """
+        import tempfile
+        from pathlib import Path
 
-    def test_sha_is_non_empty(self) -> None:
-        """C6 will replace with the real D1 §6 cache key; for now, blake2b-128
-        of the emitted source so the field is honest."""
-        compiled = _compile(
-            '//@version=6\nindicator("X")\nplot(close)\n'
-        )
+        with tempfile.TemporaryDirectory() as td:
+            compiled = compile_pine(
+                '//@version=6\nindicator("X")\nplot(close)\n',
+                cache_dir=Path(td),
+            )
+        assert compiled.cache_status == "miss"
+
+    def test_sha_is_the_c6_cache_key(self) -> None:
+        """After C6, ``sha`` is the real 64-char BLAKE2b-256 cache key
+        (was the C5 placeholder blake2b-128 → 32 hex chars)."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            compiled = compile_pine(
+                '//@version=6\nindicator("X")\nplot(close)\n',
+                cache_dir=Path(td),
+            )
         assert compiled.sha
-        assert len(compiled.sha) > 0
-        # blake2b digest_size=16 → 32 hex chars.
-        assert len(compiled.sha) == 32
+        # BLAKE2b-256 → 64 hex chars.
+        assert len(compiled.sha) == 64
+        # Valid hex.
+        int(compiled.sha, 16)
 
     def test_sha_is_deterministic(self) -> None:
-        """Identical sources → identical sha (preconditions C6's cache key)."""
-        c1 = _compile('//@version=6\nindicator("X")\nplot(close)\n')
-        c2 = _compile('//@version=6\nindicator("X")\nplot(close)\n')
+        """Identical sources → identical sha (the C6 cache key)."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            c1 = compile_pine(
+                '//@version=6\nindicator("X")\nplot(close)\n',
+                cache_dir=Path(td),
+            )
+        with tempfile.TemporaryDirectory() as td:
+            c2 = compile_pine(
+                '//@version=6\nindicator("X")\nplot(close)\n',
+                cache_dir=Path(td),
+            )
         assert c1.sha == c2.sha
 
     def test_sha_changes_when_source_changes(self) -> None:
-        c1 = _compile('//@version=6\nindicator("X")\nplot(close)\n')
-        c2 = _compile('//@version=6\nindicator("Y")\nplot(close)\n')
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            c1 = compile_pine(
+                '//@version=6\nindicator("X")\nplot(close)\n',
+                cache_dir=Path(td),
+            )
+            c2 = compile_pine(
+                '//@version=6\nindicator("Y")\nplot(close)\n',
+                cache_dir=Path(td),
+            )
         assert c1.sha != c2.sha
 
 
@@ -598,7 +635,10 @@ class TestImportConsolidation:
 
 class TestEmitDirect:
     """The :func:`emit` function is usable without going through
-    :func:`compile_pine` — tests + future tooling drive it directly."""
+    :func:`compile_pine` — tests + future tooling drive it directly.
+    Direct callers get ``sha=""`` + ``cache_status="bypass"`` (the C6 cache
+    is only wired when going through the :func:`compile_pine` facade).
+    """
 
     def test_emit_minimal_program(self) -> None:
         from openbb_pine.compiler import compile_pine_to_program
@@ -615,6 +655,25 @@ class TestEmitDirect:
         )
         assert compiled.compiler_version == "9.9.9"
         assert "9.9.9" in compiled.source
+
+    def test_emit_direct_returns_empty_sha_and_bypass(self) -> None:
+        """Direct emit() (not through compile_pine facade) → no C6 cache
+        involvement. The returned module signals this via sha="" and
+        cache_status="bypass"."""
+        from openbb_pine.compiler import compile_pine_to_program
+
+        prog = compile_pine_to_program(
+            '//@version=6\nindicator("X")\nplot(close)\n'
+        )
+        compiled = emit(
+            prog,
+            builtins_used=frozenset({"close", "plot"}),
+            security_contexts=None,
+            pine_version=6,
+            compiler_version="0.1.0",
+        )
+        assert compiled.sha == ""
+        assert compiled.cache_status == "bypass"
 
     def test_emit_threads_security_contexts(self) -> None:
         """When C3 sets security_contexts (Phase 2), emit threads it through."""

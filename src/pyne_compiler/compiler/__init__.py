@@ -10,10 +10,13 @@ Public surfaces
 * :func:`compile_pine` — high-level facade: ``str source -> CompiledModule``.
   Detects the ``//@version=`` pragma, applies :func:`migrate_v5_to_v6` if
   the source is v5, tokenises, parses, type-checks (C3), then emits Python
-  source via codegen (C5). Most callers (REST router D3 §4.6, CLI
-  ``openbb-pine run``, ``obb.pine.run``) want this. Returns the C5
-  :class:`CompiledModule` carrying ``source``, ``sha``, ``builtins_used``,
-  ``security_contexts``, ``cache_status``.
+  source via codegen (C5). Wraps the pipeline with the C6 compile cache —
+  cache probe → hit? return; else run pipeline → cache_write → return.
+  Most callers (REST router D3 §4.6, CLI ``openbb-pine run``,
+  ``obb.pine.run``) want this. Returns the C5 :class:`CompiledModule`
+  carrying ``source``, ``sha`` (the C6 cache key), ``builtins_used``,
+  ``security_contexts``, ``cache_status`` (``"hit"`` / ``"miss"`` /
+  ``"bypass"``).
 * :func:`compile_pine_to_program` — same pipeline as :func:`compile_pine`
   but stops one stage earlier (after C3's type checker) and returns the
   typed IR :class:`Program`. Intended for tests + tooling that need the
@@ -34,28 +37,44 @@ before vs. after the rewrites is observably identical.
 Higher-level entry points (REST endpoints, OBBject construction) live in
 ``openbb_pine.pine_router``; this package stays pure compiler.
 
-Cache (C6) — out of scope for the C5 bead
------------------------------------------
+Cache (C6 — bead 0e9.5.6) integration
+-------------------------------------
 
-:func:`compile_pine` always sets ``CompiledModule.cache_status="bypass"``
-and a placeholder blake2b hash. C6 (separate bead) will:
+The facade wraps the compile pipeline with a content-addressed cache
+under ``~/.openbb/pine_cache/`` (see :mod:`compile_cache`):
 
-1. Compute the real cache key per D1 §6 (blake2b over source ‖ params ‖
-   compiler_version ‖ pine_version).
-2. Lookup the cache before re-running the pipeline; set
-   ``cache_status="hit"`` and return the cached module on hit.
-3. Write the emitted source through to the cache on miss; set
-   ``cache_status="miss"``.
+1. Compute the cache key from the RAW source (before migration) so that
+   a v5 script and the equivalent hand-migrated v6 do NOT share a slot —
+   they emit different Python.
+2. Probe the cache: on hit, return the cached :class:`CompiledModule`
+   with ``cache_status="hit"`` (skip the entire compile pipeline).
+3. On miss, run lex → migrate? → parse → check → emit. Overwrite the
+   :func:`emit`-computed placeholder sha with the real cache key and set
+   ``cache_status="miss"``. Write through the cache.
+4. When ``use_cache=False``, skip the probe and the write. The returned
+   module carries ``cache_status="bypass"``. This is what the router
+   uses when a caller explicitly opts out.
 
-The seam is the public ``CompiledModule`` contract; C6 wraps without
-changing the facade signature.
+The cache key is a 256-bit BLAKE2b hash of ``source ‖ params ‖
+compiler_version ‖ pine_version`` (D1 §6.1). Corruption / stale entries
+degrade to a miss, never break compilation.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
 from openbb_pine import __version__
 from openbb_pine.compiler import ir
 from openbb_pine.compiler.codegen import emit
+from openbb_pine.compiler.compile_cache import (
+    DEFAULT_CACHE_DIR,
+    cache_read,
+    cache_write,
+    make_cache_key,
+)
 from openbb_pine.compiler.lexer import Token, tokenize
 from openbb_pine.compiler.parser import parse
 from openbb_pine.compiler.type_checker import check
@@ -76,6 +95,7 @@ __all__ = [
     "compile_pine",
     "compile_pine_to_program",
     "CompiledModule",
+    "DEFAULT_CACHE_DIR",
     "V5Rewrite",
     "V5_REWRITES",
     "detect_pine_version",
@@ -91,7 +111,9 @@ def _detect_and_migrate(source: str, target_version: int) -> tuple[str, int]:
     """
     if target_version not in (5, 6):
         from openbb_pine.errors import PineUnsupportedFeatureError
+        from openbb_pine.telemetry import record_unsupported_feature
 
+        record_unsupported_feature("PF002")
         raise PineUnsupportedFeatureError(
             message=(
                 f"PF002 compile_pine: target_version={target_version!r} is "
@@ -119,7 +141,9 @@ def _detect_and_migrate(source: str, target_version: int) -> tuple[str, int]:
         # if we reach here it's the supported-pair-mismatch case
         # (e.g. detected=6 but target=5, which we don't support).
         from openbb_pine.errors import PineUnsupportedFeatureError
+        from openbb_pine.telemetry import record_unsupported_feature
 
+        record_unsupported_feature("PF002")
         raise PineUnsupportedFeatureError(
             message=(
                 f"PF002 compile_pine: source is v{detected}, requested "
@@ -182,10 +206,17 @@ def compile_pine_to_program(
     return type_check_result.program
 
 
-def compile_pine(source: str, *, target_version: int = 6) -> CompiledModule:
+def compile_pine(
+    source: str,
+    *,
+    target_version: int = 6,
+    params: dict[str, Any] | None = None,
+    use_cache: bool = True,
+    cache_dir: Path | None = None,
+) -> CompiledModule:
     """Compile a Pine source string into a :class:`CompiledModule` (D1 §1.5).
 
-    The high-level facade. Hides four concerns from callers:
+    The high-level facade. Hides five concerns from callers:
 
     1. **Version detection.** Reads ``//@version=N`` via
        :func:`detect_pine_version`. Defaults to v6 when no pragma is
@@ -199,15 +230,43 @@ def compile_pine(source: str, *, target_version: int = 6) -> CompiledModule:
     4. **Codegen (C5).** Walks the typed IR, builds an ``ast.Module``,
        runs the closed-allowlist gate (D1 §3.3), unparses to the
        canonical Python source, wraps in a :class:`CompiledModule`.
+    5. **Cache (C6).** Content-addressed lookup under
+       ``~/.openbb/pine_cache/``. On hit, skips the entire compile
+       pipeline and returns the cached module with ``cache_status="hit"``.
+       On miss, runs the pipeline and writes the result through with
+       ``cache_status="miss"``. When ``use_cache=False``, both probe and
+       write are skipped; the returned module carries
+       ``cache_status="bypass"``.
+
+    Parameters
+    ----------
+    source
+        Pine v5 or v6 source text.
+    target_version
+        5 or 6. Defaults to 6. v5 sources are migrated transparently.
+    params
+        Optional user-supplied parameter dict, carved into the cache key
+        so different runs of the same source with different params get
+        distinct cache slots. Phase-1 callers pass ``None``; higher
+        surfaces (D3's REST router) may thread through actual params.
+    use_cache
+        When True (default), enable the C6 compile cache. When False,
+        skip both the probe and the write — useful for CI runs that
+        want a deterministic cold path.
+    cache_dir
+        Optional override for the on-disk cache directory. When None
+        (default), uses :data:`DEFAULT_CACHE_DIR`
+        (``~/.openbb/pine_cache/``). Tests + operator overrides pass a
+        tmp_path here.
 
     Returns
     -------
     CompiledModule
         Carrying ``source`` (the @pyne-headed Python text PyneCore will
-        import-and-run), ``sha`` (placeholder until C6 lands the real
-        cache key), ``builtins_used`` (the C3-populated set),
-        ``security_contexts`` (None in Phase 1),
-        ``cache_status="bypass"`` (C6's seam).
+        import-and-run), ``sha`` (the C6 cache key when ``use_cache=True``,
+        otherwise the codegen placeholder), ``builtins_used`` (the
+        C3-populated set), ``security_contexts`` (None in Phase 1),
+        ``cache_status`` (``"hit"`` / ``"miss"`` / ``"bypass"``).
 
     Raises
     ------
@@ -230,7 +289,28 @@ def compile_pine(source: str, *, target_version: int = 6) -> CompiledModule:
     valid. The parameter exists so the call-site contract is forward-
     compatible with the v6→v7 migration when TradingView ships a v7
     (PRD §11 "v7 reopens this").
+
+    Cache key uses the RAW source (before migration) so that v5 and v6
+    forms of the same script don't share a cache slot — they'd emit
+    different Python. If a caller compiled the v5 form first, then later
+    compiled the equivalent v6 form, they get distinct cached entries.
     """
+    # C6 cache probe — first, so hits skip the entire pipeline.
+    key: str | None = None
+    if use_cache:
+        # Compute the key from the RAW source (before migration). D1 §6.1.
+        cd = cache_dir if cache_dir is not None else DEFAULT_CACHE_DIR
+        key = make_cache_key(
+            source,
+            params=params,
+            compiler_version=__version__,
+            pine_version=target_version,
+        )
+        hit = cache_read(key, cache_dir=cd)
+        if hit is not None:
+            return hit  # cache_status already "hit"
+
+    # Cache miss (or bypass) — full pipeline.
     migrated, version = _detect_and_migrate(source, target_version)
     tokens = tokenize(migrated)
     program = parse(tokens, pine_version=version)
@@ -242,4 +322,19 @@ def compile_pine(source: str, *, target_version: int = 6) -> CompiledModule:
         pine_version=version,
         compiler_version=__version__,
     )
+
+    # Overwrite the emit()-produced placeholder sha + cache_status with the
+    # real cache-key / miss status. Use ``dataclasses.replace`` since
+    # ``CompiledModule`` is ``frozen=True``. When use_cache=False the sha
+    # stays as emit's placeholder and cache_status stays "bypass" — the
+    # facade's contract is that the sha you receive is always the value
+    # the cache would use if it were writing that entry (either the real
+    # key, or the placeholder when the cache is off).
+    if use_cache:
+        assert key is not None  # narrowing for type checker
+        compiled = replace(compiled, sha=key, cache_status="miss")
+        cache_write(compiled, cache_dir=cd)
+    # When use_cache=False, keep emit()'s placeholder shape (sha="" +
+    # cache_status="bypass") — caller opted out of the cache contract.
+
     return compiled
