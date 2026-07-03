@@ -342,6 +342,17 @@ class _IRBuilder(Transformer):
         tok = children[0]
         return ir.Name(loc=self._sp(tok), id=str(tok))
 
+    def strategy_name_expr(self, children: list[LarkToken]) -> ir.Name:
+        # ``strategy`` reclassified to KW_STRATEGY by the token adapter, but
+        # legitimately appears in expression position as the Pine ``strategy``
+        # namespace (``strategy.entry``, ``strategy.long``, kwargs like
+        # ``default_qty_type=strategy.percent_of_equity``). Grammar branch
+        # ``primary: KW_STRATEGY -> strategy_name_expr`` reifies it as a
+        # plain ``ir.Name`` so the postfix chain (`.entry`, `.long`, etc.)
+        # composes normally.
+        tok = children[0]
+        return ir.Name(loc=self._sp(tok), id=str(tok))
+
     def paren_expr(self, children: list[Any]) -> Any:
         # children: LPAREN expr RPAREN — return the inner expression
         return next(c for c in children if isinstance(c, ir.Expression))

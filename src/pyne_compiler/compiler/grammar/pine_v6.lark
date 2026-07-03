@@ -241,8 +241,20 @@ call_arg:  NAME ASSIGN expression -> kwarg
 // 10. Primary
 primary: literal
        | NAME                              -> name_expr
+       | KW_STRATEGY                       -> strategy_name_expr
        | LPAREN expression RPAREN          -> paren_expr
        | tuple_literal
+
+// ``strategy`` is reclassified to KW_STRATEGY unconditionally by the token
+// adapter so the top-level ``strategy(...)`` directive rule (line ~101) can
+// branch cleanly. But ``strategy`` is ALSO a Pine namespace value that can
+// appear inside expressions: ``strategy.entry(...)``, ``strategy.long`` as
+// a value, ``default_qty_type=strategy.percent_of_equity`` as a kwarg. We
+// re-admit it as a primary here so the postfix chain (`.entry`, `.long`,
+// etc.) hangs off it via the normal attribute_tail path. IR builds an
+// ir.Name(id="strategy"). Earley's ambiguity="resolve" prefers the
+// script_directive derivation at top level (validated by the existing
+// PF010 codegen test).
 
 tuple_literal: LBRACKET expression (COMMA expression)+ RBRACKET
 

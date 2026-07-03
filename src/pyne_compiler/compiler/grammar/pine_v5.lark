@@ -237,8 +237,13 @@ call_arg:  NAME ASSIGN expression -> kwarg
 // 10. Primary
 primary: literal
        | NAME                              -> name_expr
+       | KW_STRATEGY                       -> strategy_name_expr
        | LPAREN expression RPAREN          -> paren_expr
        | tuple_literal
+
+// See pine_v6.lark for the rationale on the KW_STRATEGY primary carve-out
+// (namespace value: `strategy.entry`, `strategy.long`, kwargs like
+// `default_qty_type=strategy.percent_of_equity`).
 
 tuple_literal: LBRACKET expression (COMMA expression)+ RBRACKET
 
