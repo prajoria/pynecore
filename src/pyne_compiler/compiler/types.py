@@ -223,3 +223,13 @@ class CompiledModule:
 
     cache_status: Literal["hit", "miss", "bypass"]
     """Was this compilation a cache hit, miss, or bypass? D2 §6.3 reads this."""
+
+    script_type: Literal["indicator", "strategy", "library"] = "indicator"
+    """Top-level Pine declaration kind (D5 §5.1 — script-type detection).
+
+    Defaults to ``"indicator"`` so existing constructor call sites (codegen,
+    compile_cache, tests) that pre-date the M2 strategy engine keep working
+    unchanged. Codegen will overwrite this based on which top-level declaration
+    fires (``indicator(...)`` / ``strategy(...)`` / ``library(...)``); the
+    executor forks on it to enable strategy vs. indicator branches.
+    """
