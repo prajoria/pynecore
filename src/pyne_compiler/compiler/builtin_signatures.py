@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from openbb_pine.compiler.types import PineType, Scalar, TupleT
+from openbb_pine.compiler.types import AnyT, PineType, Scalar, TupleT
 
 __all__ = [
     "Signature",
@@ -67,6 +67,13 @@ class Signature:
     returns: PineType
     version: int = 6
     notes: str | None = "STUB"
+    kwargs: dict[str, PineType] | None = None
+    """Optional keyword-only parameters (D5 §7.2). Distinct from ``args``
+    which enumerates positional-or-keyword parameters. C3 uses this to
+    type-check keyword-only slots like ``request.security(..., gaps=?,
+    lookahead=?)``. Defaults to ``None`` so pre-D5 signatures keep working
+    unchanged — every existing entry only uses ``args``.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +93,24 @@ _INPUT_FLOAT = PineType(qualifier="input", inner=Scalar(kind="float"))
 _INPUT_BOOL = PineType(qualifier="input", inner=Scalar(kind="bool"))
 _INPUT_STRING = PineType(qualifier="input", inner=Scalar(kind="string"))
 _CONST_COLOR = PineType(qualifier="const", inner=Scalar(kind="color"))
+# Added for bead y86 (D5 §7.2 request.security signature).
+_CONST_BOOL = PineType(qualifier="const", inner=Scalar(kind="bool"))
+# _CONST_STRING (const<string>) — kept as a shared shorthand for downstream
+# beads (h14's ``strategy.entry`` id/direction args land here). Not
+# referenced by the y86 signature itself (``request.security`` uses
+# ``_SIMPLE_STRING`` per D5 §7.2), so this alias is intentionally unused
+# in this PR — no dead-code removal; the entry is a shared constant.
+_CONST_STRING = PineType(qualifier="const", inner=Scalar(kind="string"))
+# ``_SERIES_ANY`` models Pine's polymorphic ``series<T>`` — request.security's
+# ``expression`` argument and its return type share this shape (T is inferred
+# from ``expression`` per D5 §7.2). We encode "any inner" via the dedicated
+# :class:`AnyT` sentinel (NOT a fresh ``UnknownT``): four other type_checker
+# fallback sites use ``UnknownT(-1)`` for "compiler could not infer", and
+# structural equality on frozen dataclasses (``UnknownT(-1) == UnknownT(-1)``
+# is True) would silently unify unrelated code paths through the sentinel.
+# ``AnyT`` unifies with anything by design (see :func:`unify_inner`) and is
+# safe to share across signatures.
+_SERIES_ANY = PineType(qualifier="series", inner=AnyT())
 
 
 def _src_length() -> tuple[tuple[str, PineType], ...]:
@@ -458,6 +483,30 @@ BUILTIN_SIGNATURES: dict[str, Signature] = {
     "hlc3":          Signature(args=(), returns=_SERIES_FLOAT),
     "ohlc4":         Signature(args=(), returns=_SERIES_FLOAT),
     "bar_index":     Signature(args=(), returns=_SERIES_INT),
+    # ---------------------------------------------------------------------------
+    # request.security signature (bead 0e9.6.y86 — D5 §4.1, §7.2)
+    # ---------------------------------------------------------------------------
+    # Static-symbol form: ``request.security("SPY", "1D", close)`` — C3
+    # populates one SecurityContext per call site (dynamic_symbol=False,
+    # dynamic_timeframe=False). Fully-dynamic form per D5 §4.4:
+    # ``request.security(syminfo.ticker, "1D", close)`` — C3 flags
+    # dynamic_symbol=True; runtime falls back to lazy per-bar fetch.
+    # Return type is _SERIES_ANY so the polymorphic ``expression`` shape
+    # (series<float> for ``close``, series<bool> for a comparison, etc.)
+    # flows through the type checker without a rejection.
+    "request.security": Signature(
+        args=(
+            ("symbol",     _SIMPLE_STRING),
+            ("timeframe",  _SIMPLE_STRING),
+            ("expression", _SERIES_ANY),
+        ),
+        kwargs={
+            "gaps":      _CONST_BOOL,
+            "lookahead": _CONST_BOOL,
+        },
+        returns=_SERIES_ANY,
+        notes="IMPLEMENTED",
+    ),
 }
 
 

@@ -349,7 +349,21 @@ def cache_write(compiled: CompiledModule, *, cache_dir: Path = DEFAULT_CACHE_DIR
             None
             if compiled.security_contexts is None
             else {
-                k: {"symbol": v.symbol, "timeframe": v.timeframe, "expr": v.expr}
+                # Round-trip EVERY SecurityContext field — the dynamic_*
+                # flags are load-bearing for the runtime dispatcher
+                # (D5 §4.4); dropping them silently turns a working
+                # dynamic-symbol script into a stale-flag failure on the
+                # second compile (see PR #322 review — comment ID
+                # 3522845893). ``cache_read`` reconstructs via
+                # ``SecurityContext(**v)`` so any new field added to the
+                # dataclass must be added here too.
+                k: {
+                    "symbol": v.symbol,
+                    "timeframe": v.timeframe,
+                    "expr": v.expr,
+                    "dynamic_symbol": v.dynamic_symbol,
+                    "dynamic_timeframe": v.dynamic_timeframe,
+                }
                 for k, v in compiled.security_contexts.items()
             }
         ),

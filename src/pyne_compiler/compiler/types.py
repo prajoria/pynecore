@@ -37,6 +37,7 @@ __all__ = [
     "TupleT",
     "NaT",
     "UnknownT",
+    "AnyT",
     "can_promote",
     "unify",
     "unify_inner",
@@ -119,6 +120,23 @@ class UnknownT(InnerType):
     var_id: int
 
 
+@dataclass(frozen=True, slots=True)
+class AnyT(InnerType):
+    """A polymorphic *bound* type variable used by signatures whose return
+    type matches an incoming operand's type (e.g. ``request.security``'s
+    ``expression`` argument and return type share the shape).
+
+    Distinct from :class:`UnknownT` — ``UnknownT(-1)`` is used at four
+    fallback sites in the type checker as "compiler could not infer";
+    conflating "polymorphic" and "unresolved" causes silent unification of
+    unrelated code paths under structural equality (``UnknownT(-1) ==
+    UnknownT(-1)`` is True). ``AnyT`` unifies with anything by design (same
+    ``na``-style propagation lattice), so it's safe to embed in the shared
+    ``_SERIES_ANY`` sentinel without aliasing to unrelated ``UnknownT``
+    fallbacks (see PR #322 review — comment ID 3522847216).
+    """
+
+
 # ---------------------------------------------------------------------------
 # PineType pair (D1 §4.1)
 # ---------------------------------------------------------------------------
@@ -150,6 +168,10 @@ def inner_compatible(a: InnerType, b: InnerType) -> bool:
     # Na unifies with anything (PT006: na propagates the other side's type).
     if isinstance(a, NaT) or isinstance(b, NaT):
         return True
+    # AnyT is a bound polymorphic sentinel (see docstring on AnyT); it
+    # unifies with anything, mirroring the na-propagation lattice.
+    if isinstance(a, AnyT) or isinstance(b, AnyT):
+        return True
     return a == b
 
 
@@ -158,6 +180,10 @@ def unify_inner(a: InnerType, b: InnerType) -> InnerType:
     if isinstance(a, NaT):
         return b
     if isinstance(b, NaT):
+        return a
+    if isinstance(a, AnyT):
+        return b
+    if isinstance(b, AnyT):
         return a
     return a
 
@@ -187,11 +213,30 @@ class SecurityContext:
     Codegen rewrites each such call into a structured ``SecurityContext`` so
     D2 §5.1 step 2 can set up multi-symbol dispatch ahead of
     ``ScriptRunner.run_iter()``.
+
+    The ``dynamic_*`` flags implement D5 §4.4's fully-dynamic
+    symbol/timeframe support: when C3 cannot statically resolve the symbol
+    or timeframe argument (e.g. ``request.security(syminfo.ticker, tf,
+    expr)``), it sets the corresponding flag so the runtime dispatcher
+    (D2's ``security_dispatcher``) knows to fall back to lazy per-bar fetch
+    instead of prefetching. Documented perf caveat per D5 §4.4:
+    dynamic-symbol scripts run 5-10× slower than static-symbol.
+
+    Both flags default to ``False`` to preserve backward compatibility with
+    existing constructions like
+    ``SecurityContext(symbol="AAPL", timeframe="1D", expr="close")``.
     """
 
     symbol: str
     timeframe: str
     expr: str  # serialized lowered expression; D2 reads opaquely
+    dynamic_symbol: bool = False
+    """True when C3 could not statically resolve the symbol (e.g.
+    ``request.security(syminfo.ticker, ...)``). Signals runtime to defer
+    to lazy per-bar fetch (D5 §4.4)."""
+    dynamic_timeframe: bool = False
+    """True when C3 could not statically resolve the timeframe. Same
+    runtime consequence as ``dynamic_symbol`` (D5 §4.4)."""
 
 
 @dataclass(frozen=True, slots=True)
