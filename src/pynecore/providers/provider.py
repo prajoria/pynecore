@@ -1,7 +1,7 @@
-from typing import Callable
+from typing import Callable, Iterator
 from abc import abstractmethod, ABCMeta
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import tomllib
 
 from ..types.ohlcv import OHLCV
@@ -184,3 +184,90 @@ class Provider(metaclass=ABCMeta):
         Load OHLV data from the file
         """
         return OHLCVReader(str(self.ohlcv_path))
+
+    def stream(
+            self,
+            symbol: str,
+            timeframe: str,
+            *,
+            start: datetime | None = None,
+            end: datetime | None = None,
+    ) -> Iterator[OHLCV]:
+        """Yield OHLCV bars in chronological order for ``(symbol, timeframe)``.
+
+        Default implementation reads from the ``.ohlcv`` file populated by
+        :meth:`download_ohlcv`. Subclasses MAY override for direct-query
+        optimization (e.g. an FMP subclass hitting REST directly, no file
+        intermediate; a SQLite subclass issuing one SELECT).
+
+        Behavioral contract (Pine Extraction Design §5.1 / §5.4):
+
+        - For closed historical ranges, ``list(stream(...))`` MUST equal
+          ``fetch(...)``. For live ranges, ``stream()`` MAY include a
+          forming bar that ``fetch()`` excludes.
+        - ``start`` / ``end`` are inclusive when supplied; ``None`` means
+          unbounded on that side.
+        - ``start > end`` returns no bars (SQL-consistent — spec §5.4
+          conformance check #4, Rev 3). It does NOT raise.
+        - Yielded timestamps MUST be UTC and monotonically non-decreasing.
+        - Gap-filled bars (volume == -1, written by :class:`OHLCVWriter`
+          to preserve interval regularity) are silently skipped so
+          downstream consumers see only real trading activity.
+
+        The ``symbol`` and ``timeframe`` arguments are accepted at call
+        time per spec §5 (call-parameterized, stateless across calls).
+        The default file-backed impl still resolves the on-disk path via
+        the instance's ``symbol``/``timeframe`` set at construction time;
+        subclasses that override MAY honor the call-time values for true
+        multi-symbol reuse of a single Provider instance.
+        """
+        # Guard: reversed range → empty output (spec §5.4 conformance check #4).
+        # An early ``return`` inside a generator terminates it immediately,
+        # yielding nothing to the caller.
+        if start is not None and end is not None and start > end:
+            return
+
+        # OHLCVReader supports the context-manager protocol; entering it
+        # opens the underlying mmap. Iterating the reader yields OHLCV
+        # tuples in file order, which is chronological by construction.
+        with self.load_ohlcv_data() as reader:
+            for bar in reader:
+                # Skip gap fills (volume == -1). These are written by
+                # OHLCVWriter to preserve a uniform bar interval when the
+                # source stream has holes; they are not real bars.
+                if bar.volume < 0:
+                    continue
+
+                # Convert epoch seconds → aware UTC datetime for comparison
+                # against the start/end filters, which the spec requires to
+                # be timezone-aware.
+                bar_dt = datetime.fromtimestamp(bar.timestamp, tz=timezone.utc)
+
+                if start is not None and bar_dt < start:
+                    continue
+                if end is not None and bar_dt > end:
+                    # Bars are chronologically sorted; safe to stop here.
+                    break
+
+                yield bar
+
+    def fetch(
+            self,
+            symbol: str,
+            timeframe: str,
+            *,
+            start: datetime | None = None,
+            end: datetime | None = None,
+    ) -> list[OHLCV]:
+        """Return a bar range as a materialized list.
+
+        Default implementation: ``list(self.stream(...))``. Subclasses MAY
+        override to issue a single batched query (e.g. one SQL SELECT)
+        instead of iterating. Ordering + UTC guarantees are identical to
+        :meth:`stream`.
+
+        For closed historical ranges, ``fetch(...) == list(stream(...))``
+        (spec §5.1). For live/forming ranges, ``fetch()`` MAY exclude a
+        forming bar that ``stream()`` would yield.
+        """
+        return list(self.stream(symbol, timeframe, start=start, end=end))
