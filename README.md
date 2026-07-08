@@ -121,6 +121,15 @@ pip install pynesys-pynecore[all]
 
 > **Note for Windows users**: PyneCore requires timezone data that is not included in Windows by default. The `[cli]` and `[all]` installations automatically include the `tzdata` package. If you're using the basic installation and encounter timezone errors, install it manually with `pip install tzdata`.
 
+### Running the tests
+
+To run the pynecore test suite in a fresh clone, install the development and CLI extras so that `pytest-spec` (referenced by `addopts = --spec` in `pytest.ini`) and the CLI import chain (`typer`, `rich`, `tzdata`) are available:
+
+```bash
+pip install -e ".[dev,cli]"
+pytest tests/
+```
+
 ## Getting Started
 
 ### Create a Simple Script

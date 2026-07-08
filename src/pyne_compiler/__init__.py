@@ -11,4 +11,10 @@ setuptools can discover it alongside ``src/pynecore/`` without dragging in
 any compiler internals that do not exist yet.
 """
 
-__version__ = "0.1.0-pre-extraction"
+#: Package version. PEP 440-clean so ``packaging.version.Version(__version__)``
+#: succeeds — design §6.E3 step 7 embeds this string in ``CompiledModule.
+#: compiler_version`` and the compile-cache-key hash, and downstream code
+#: that parses it must not raise ``InvalidVersion``. The ``+pre.extraction``
+#: local-version segment (dots, not dashes) preserves the human-readable
+#: intent while satisfying PEP 440. Promoted to a real release number at E2.
+__version__ = "0.1.0+pre.extraction"
