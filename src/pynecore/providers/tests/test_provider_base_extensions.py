@@ -342,6 +342,7 @@ def __test_subclass_may_override_stream__(tmp_path: Path) -> None:
             *,
             start: datetime | None = None,
             end: datetime | None = None,
+            include_gaps: bool = False,
         ) -> Iterator[OHLCV]:
             yield sentinel_bar
 
@@ -354,3 +355,162 @@ def __test_subclass_may_override_stream__(tmp_path: Path) -> None:
     # Default fetch() consumes the overridden stream() → same content.
     fetched = provider.fetch("TESTSYM", "1D")
     assert fetched == [sentinel_bar]
+
+
+#
+# Regression tests for PR #2 review findings (bd-dnf).
+#
+# BUG #1: default stream() must raise ValueError on mode-1 symbol/timeframe
+# mismatch instead of silently returning the construction-time symbol's data
+# (spec §5.4 check #5). BUG #2: missing .ohlcv file must return [] instead
+# of raw FileNotFoundError (spec §5.4 check #3). QUESTION #3: include_gaps
+# opt-in must expose OHLCVReader.read_from's skip_gaps lever. NIT: no test
+# for gap-fill skipping or naive-datetime rejection.
+#
+
+
+class _GapFillProvider(_MinimalProvider):
+    """Writes 5 daily bars with a synthetic gap on Jan 3 so OHLCVWriter
+    auto-fills that day with a volume=-1 sentinel bar (gap-fill marker)."""
+
+    def download_ohlcv(  # type: ignore[override]
+        self,
+        time_from: datetime | None = None,
+        time_to: datetime | None = None,
+        on_progress: Callable[[datetime], None] | None = None,
+        limit: int | None = None,
+    ) -> None:
+        assert self.ohlcv_file is not None, "call inside `with provider:`"
+        # Write bars for Jan 1, 2, 4, 5 (skip Jan 3). OHLCVWriter fills
+        # Jan 3 automatically with the previous close and volume=-1 to
+        # preserve the uniform 1D interval — this is the gap-fill marker
+        # that stream() must skip by default.
+        for i in [1, 2, 4, 5]:
+            ts = int(datetime(2024, 1, i, tzinfo=timezone.utc).timestamp())
+            self.ohlcv_file.write(OHLCV(
+                timestamp=ts,
+                open=float(i), high=float(i), low=float(i), close=float(i),
+                volume=1.0,
+            ))
+
+
+def __test_stream_skips_gap_fill_bars_by_default__(tmp_path: Path) -> None:
+    """Default stream() drops volume=-1 gap-fill bars (spec §5 "real
+    trading activity"). The underlying file has 5 bars (Jan 1-5 with a
+    synthetic vol=-1 marker on Jan 3), stream() yields 4."""
+    provider = _GapFillProvider(
+        symbol="TESTSYM", timeframe="1D", ohlv_dir=tmp_path, config_dir=tmp_path,
+    )
+    with provider:
+        provider.download_ohlcv()
+    # Verify the underlying file did get a gap-fill marker.
+    with provider.load_ohlcv_data() as reader:
+        raw = list(reader)
+    assert len(raw) == 5, "OHLCVWriter should auto-fill Jan 3 with vol=-1"
+    assert any(b.volume < 0 for b in raw), "gap-fill marker missing"
+
+    bars = provider.fetch("TESTSYM", "1D")
+    assert len(bars) == 4, "gap-fill bar should be skipped by default"
+    assert all(b.volume >= 0 for b in bars), "no vol=-1 bars should survive"
+
+
+def __test_stream_includes_gap_fill_bars_when_opted_in__(tmp_path: Path) -> None:
+    """``include_gaps=True`` preserves vol=-1 markers (spec §5 "MAY" clause
+    — matches OHLCVReader.read_from's skip_gaps opt-in)."""
+    provider = _GapFillProvider(
+        symbol="TESTSYM", timeframe="1D", ohlv_dir=tmp_path, config_dir=tmp_path,
+    )
+    with provider:
+        provider.download_ohlcv()
+
+    bars = provider.fetch("TESTSYM", "1D", include_gaps=True)
+    assert len(bars) == 5, "include_gaps=True should preserve gap-fill markers"
+    assert any(b.volume < 0 for b in bars), "gap-fill marker should be visible"
+
+
+def __test_stream_raises_on_naive_start_datetime__(tmp_path: Path) -> None:
+    """Naive datetimes are ambiguous across timezones; spec §5 requires
+    aware. ``.timestamp()`` on naive silently interprets in local tz —
+    a cross-machine reproducibility footgun — so we reject explicitly."""
+    provider = _make_provider(tmp_path)
+    _seed(provider)
+    with pytest.raises(TypeError, match="timezone-aware"):
+        provider.fetch(
+            "TESTSYM", "1D",
+            start=datetime(2024, 1, 1),  # no tzinfo
+            end=datetime(2024, 1, 5, tzinfo=timezone.utc),
+        )
+
+
+def __test_stream_raises_on_naive_end_datetime__(tmp_path: Path) -> None:
+    """Same guard on the end bound."""
+    provider = _make_provider(tmp_path)
+    _seed(provider)
+    with pytest.raises(TypeError, match="timezone-aware"):
+        provider.fetch(
+            "TESTSYM", "1D",
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2024, 1, 5),  # no tzinfo
+        )
+
+
+def __test_stream_raises_on_call_time_symbol_mismatch__(tmp_path: Path) -> None:
+    """BUG #1: mode-1 default must fail loud when call-time symbol differs
+    from construction-time (spec §5.4 check #5). The old impl silently
+    returned the construction-time symbol's data — a data-corruption bug."""
+    provider = _make_provider(tmp_path, symbol="TESTSYM")
+    _seed(provider)
+    with pytest.raises(ValueError, match="does not match construction-time"):
+        provider.fetch("DIFFERENT_SYM", "1D")
+    with pytest.raises(ValueError, match="does not match construction-time"):
+        list(provider.stream("DIFFERENT_SYM", "1D"))
+
+
+def __test_stream_raises_on_call_time_timeframe_mismatch__(tmp_path: Path) -> None:
+    """Same guard on timeframe — a mode-1 provider constructed for 1D
+    cannot silently return 1D data when asked for 1H."""
+    provider = _make_provider(tmp_path, symbol="TESTSYM")
+    _seed(provider)
+    with pytest.raises(ValueError, match="does not match construction-time"):
+        provider.fetch("TESTSYM", "1H")
+
+
+def __test_stream_returns_empty_when_ohlcv_file_missing__(tmp_path: Path) -> None:
+    """BUG #2: missing .ohlcv file → ``[]``, not raw FileNotFoundError
+    (spec §5.4 check #3 — 'unknown range must return [] cleanly').
+    The old impl leaked an internal file-format concern to the caller."""
+    # Construct provider without calling download_ohlcv → no .ohlcv file.
+    provider = _make_provider(tmp_path)
+    assert not provider.ohlcv_path.exists(), "test premise: file must not exist"
+
+    result = provider.fetch("TESTSYM", "1D")
+    assert result == []
+
+    # stream() should also yield nothing (not raise on iteration).
+    assert list(provider.stream("TESTSYM", "1D")) == []
+
+
+def __test_stream_uses_read_from_fast_path_semantics__(tmp_path: Path) -> None:
+    """QUESTION #4: default stream() delegates to OHLCVReader.read_from,
+    which uses byte-offset positioning (O(range) — not O(file)). We can't
+    directly assert perf here, but we can lock in that the semantics still
+    match the previous Python-side impl exactly: start after last bar
+    yields [], start on the first bar yields all bars from there, etc."""
+    provider = _make_provider(tmp_path)
+    _seed(provider)
+
+    # Start strictly after the last bar → empty (get_positions clamps
+    # start_pos to size-1, so without our post-filter this would yield
+    # the last bar spuriously). Our regression test locks the exact bound.
+    result = provider.fetch(
+        "TESTSYM", "1D",
+        start=datetime(2024, 1, 6, tzinfo=timezone.utc),
+    )
+    assert result == []
+
+    # End strictly before the first bar → empty.
+    result = provider.fetch(
+        "TESTSYM", "1D",
+        end=datetime(2023, 12, 31, tzinfo=timezone.utc),
+    )
+    assert result == []

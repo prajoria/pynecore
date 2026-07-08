@@ -1,7 +1,7 @@
 from typing import Callable, Iterator
 from abc import abstractmethod, ABCMeta
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
 import tomllib
 
 from ..types.ohlcv import OHLCV
@@ -192,6 +192,7 @@ class Provider(metaclass=ABCMeta):
             *,
             start: datetime | None = None,
             end: datetime | None = None,
+            include_gaps: bool = False,
     ) -> Iterator[OHLCV]:
         """Yield OHLCV bars in chronological order for ``(symbol, timeframe)``.
 
@@ -206,50 +207,121 @@ class Provider(metaclass=ABCMeta):
           ``fetch(...)``. For live ranges, ``stream()`` MAY include a
           forming bar that ``fetch()`` excludes.
         - ``start`` / ``end`` are inclusive when supplied; ``None`` means
-          unbounded on that side.
+          unbounded on that side. Both must be timezone-aware if provided
+          — naive datetimes are ambiguous across timezones and raise
+          ``TypeError``.
         - ``start > end`` returns no bars (SQL-consistent — spec §5.4
           conformance check #4, Rev 3). It does NOT raise.
-        - Yielded timestamps MUST be UTC and monotonically non-decreasing.
+        - Yielded ``OHLCV.timestamp`` values are Unix epoch seconds (int),
+          which by convention represent UTC; the ordering is monotonically
+          non-decreasing.
         - Gap-filled bars (volume == -1, written by :class:`OHLCVWriter`
-          to preserve interval regularity) are silently skipped so
-          downstream consumers see only real trading activity.
+          to preserve interval regularity) are skipped by default so
+          downstream consumers see only real trading activity. Set
+          ``include_gaps=True`` to preserve them (spec §5 "MAY" clause
+          — matches :meth:`OHLCVReader.read_from`'s ``skip_gaps`` opt-in).
+        - Missing underlying data (e.g. ``.ohlcv`` file was never populated
+          by :meth:`download_ohlcv`) returns ``[]`` per spec §5.4 check #3
+          — a raw ``FileNotFoundError`` would leak an internal file-format
+          concern to the caller.
 
         The ``symbol`` and ``timeframe`` arguments are accepted at call
         time per spec §5 (call-parameterized, stateless across calls).
         The default file-backed impl still resolves the on-disk path via
-        the instance's ``symbol``/``timeframe`` set at construction time;
-        subclasses that override MAY honor the call-time values for true
-        multi-symbol reuse of a single Provider instance.
+        the instance's ``symbol``/``timeframe`` set at construction time,
+        so a mode-1 mismatch (call-time values differ from construction-
+        time) raises ``ValueError`` to prevent silent wrong-symbol data
+        leakage — subclasses that override MAY honor the call-time values
+        for true multi-symbol reuse of a single Provider instance
+        (spec §5.2 mode 2).
         """
+        # Guard: mode-1 (single-symbol) providers must fail loud on a
+        # call-time symbol/timeframe mismatch, otherwise the file-backed
+        # default silently returns the construction-time symbol's data
+        # (verified via a differing-symbol fetch). Only check when the
+        # instance has a concrete symbol/timeframe — a Provider built with
+        # no symbol is treated as unrestricted (spec §5.2 mode-2 subclasses
+        # override this method anyway).
+        if self.symbol is not None and symbol != self.symbol:
+            raise ValueError(
+                f"call-time symbol {symbol!r} does not match construction-time "
+                f"{self.symbol!r}; the default file-backed stream() is mode-1 "
+                "(single-symbol per instance). Override stream() for multi-"
+                "symbol reuse (spec §5.2 mode 2)."
+            )
+        if self.timeframe is not None and timeframe != self.timeframe:
+            raise ValueError(
+                f"call-time timeframe {timeframe!r} does not match construction-"
+                f"time {self.timeframe!r}; the default file-backed stream() is "
+                "mode-1 (single-timeframe per instance). Override stream() for "
+                "multi-timeframe reuse (spec §5.2 mode 2)."
+            )
+
+        # Guard: naive datetimes are ambiguous (spec §5 requires timezone-
+        # aware). ``.timestamp()`` on a naive datetime silently interprets
+        # it in the local timezone, which is a footgun for cross-machine
+        # reproducibility — reject explicitly with a typed error. This
+        # check MUST run before the reversed-range guard below, because
+        # comparing naive vs aware raises a generic TypeError that would
+        # mask our purpose-specific message.
+        if start is not None and start.tzinfo is None:
+            raise TypeError(
+                "start must be a timezone-aware datetime (spec §5); "
+                "got naive datetime which is ambiguous across timezones."
+            )
+        if end is not None and end.tzinfo is None:
+            raise TypeError(
+                "end must be a timezone-aware datetime (spec §5); "
+                "got naive datetime which is ambiguous across timezones."
+            )
+
         # Guard: reversed range → empty output (spec §5.4 conformance check #4).
         # An early ``return`` inside a generator terminates it immediately,
         # yielding nothing to the caller.
         if start is not None and end is not None and start > end:
             return
 
-        # OHLCVReader supports the context-manager protocol; entering it
-        # opens the underlying mmap. Iterating the reader yields OHLCV
-        # tuples in file order, which is chronological by construction.
-        with self.load_ohlcv_data() as reader:
-            for bar in reader:
-                # Skip gap fills (volume == -1). These are written by
-                # OHLCVWriter to preserve a uniform bar interval when the
-                # source stream has holes; they are not real bars.
-                if bar.volume < 0:
-                    continue
+        # Guard: missing .ohlcv file → empty output (spec §5.4 check #3).
+        # ``OHLCVReader.open()`` calls ``open(path, 'rb')`` which raises
+        # ``FileNotFoundError`` — a leaky internal file-format concern.
+        # We convert it to the spec-compliant "unknown range returns []"
+        # semantics. The distinction between "never downloaded" and
+        # "downloaded but empty range" can still be recovered by the
+        # caller via ``is_symbol_info_exists()``.
+        try:
+            reader_cm = self.load_ohlcv_data()
+            reader_cm.open()
+        except FileNotFoundError:
+            return
 
-                # Convert epoch seconds → aware UTC datetime for comparison
-                # against the start/end filters, which the spec requires to
-                # be timezone-aware.
-                bar_dt = datetime.fromtimestamp(bar.timestamp, tz=timezone.utc)
+        # Convert start/end datetimes → epoch seconds so we can delegate
+        # to ``OHLCVReader.read_from``'s O(range) fast-path
+        # (``get_positions`` computes byte offsets from the interval
+        # header — no full-file scan). ``read_from`` treats a start of
+        # ``0`` as "beginning of file" (falsy → get_positions branch),
+        # so we pass 0 when start is None.
+        start_ts = int(start.timestamp()) if start is not None else None
+        end_ts = int(end.timestamp()) if end is not None else None
 
-                if start is not None and bar_dt < start:
+        try:
+            for bar in reader_cm.read_from(
+                start_timestamp=start_ts if start_ts is not None else 0,
+                end_timestamp=end_ts,
+                skip_gaps=not include_gaps,
+            ):
+                # ``get_positions`` clamps start_pos to ``size - 1`` when
+                # start is past the last bar (see ohlcv_file.py:1691), and
+                # end_pos to +1 bar of end_diff (see :1704). Both can yield
+                # a bar strictly outside the requested [start, end] range.
+                # Re-check the bar timestamp to enforce exact inclusive
+                # bounds and stop early when we cross ``end`` (chronological).
+                if start_ts is not None and bar.timestamp < start_ts:
                     continue
-                if end is not None and bar_dt > end:
-                    # Bars are chronologically sorted; safe to stop here.
+                if end_ts is not None and bar.timestamp > end_ts:
                     break
-
                 yield bar
+        finally:
+            reader_cm.close()
 
     def fetch(
             self,
@@ -258,16 +330,19 @@ class Provider(metaclass=ABCMeta):
             *,
             start: datetime | None = None,
             end: datetime | None = None,
+            include_gaps: bool = False,
     ) -> list[OHLCV]:
         """Return a bar range as a materialized list.
 
         Default implementation: ``list(self.stream(...))``. Subclasses MAY
         override to issue a single batched query (e.g. one SQL SELECT)
         instead of iterating. Ordering + UTC guarantees are identical to
-        :meth:`stream`.
+        :meth:`stream`, and ``include_gaps`` is forwarded unchanged.
 
         For closed historical ranges, ``fetch(...) == list(stream(...))``
         (spec §5.1). For live/forming ranges, ``fetch()`` MAY exclude a
         forming bar that ``stream()`` would yield.
         """
-        return list(self.stream(symbol, timeframe, start=start, end=end))
+        return list(self.stream(
+            symbol, timeframe, start=start, end=end, include_gaps=include_gaps,
+        ))
