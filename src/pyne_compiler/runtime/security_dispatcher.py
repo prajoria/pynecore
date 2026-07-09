@@ -1,10 +1,10 @@
 """D5 §4.2 runtime dispatcher — prefetches every ``request.security``
 secondary series before ``ScriptRunner.run_iter()`` starts.
 
-Fetching lazily on every bar would blow the FMP retry budget on the first
-long-running strategy — a script with 3 secondaries × 5000 bars = 15 000
-extra fetches, each subject to 5 retries. Prefetching once, aligning to
-the primary bar grid via forward-fill, and threading a
+Fetching lazily on every bar would blow the shared retry budget on the
+first long-running strategy — a script with 3 secondaries × 5000 bars =
+15 000 extra fetches, each subject to 5 retries. Prefetching once,
+aligning to the primary bar grid via forward-fill, and threading a
 ``{context_id: DataFrame}`` map to the executor collapses that to 3
 fetches total.
 
@@ -15,7 +15,12 @@ Priority order (D5 §4.2, verbatim):
        runtime), defer to lazy per-bar fetch — log a warning and return an
        empty DataFrame from this pass so the executor's fallback path takes
        over. Documented 5-10× perf caveat (D5 §4.4).
-    3. Else fetch via ``fmp_provider`` wrapped in the shared retry budget.
+    3. Else fetch via ``provider.fetch(...)`` — the caller passes in a
+       concrete :class:`_DataProviderStub` (post-E1: real
+       ``pynecore.providers.Provider``). Concrete-provider concerns
+       (retry envelope, request builder, provider-name reuse) live in the
+       caller — see :mod:`openbb_pine.runtime.executor` (post-E0.3:
+       :mod:`~executor_shell`).
     4. Post-fetch: forward-fill align to the primary series' timestamps so
        PyneCore's per-bar reads never see NaN in the middle of a series.
 
@@ -29,6 +34,16 @@ substrate via a module-level global — that monkey-patch
 (``_install_secondaries_hook``) is a separate bead (n6j) and is
 DELIBERATELY not touched here.
 
+E0.2 abstraction boundary
+-------------------------
+The dispatcher no longer imports concrete-provider types or their retry
+helpers. Callers wrap their concrete data provider (whatever it is) in a
+:class:`_DataProviderStub`-conforming object and pass it via ``provider=``.
+Any retry / envelope semantics (e.g. transient-error handling for a
+network-backed provider) is now the caller's responsibility to install
+around the stub's ``fetch``. See the E0.2 gate test in
+``test_prefetch_security.py`` for the enforced banned-import list.
+
 Clean-room note: I have not viewed TradingView or PyneComp source code.
 """
 
@@ -41,16 +56,11 @@ from typing import TYPE_CHECKING, Any, Callable
 import pandas as pd
 
 from openbb_pine.compiler_errors import PineDataResolverError
-from openbb_pine.runtime.fmp_provider import (
-    FMPOHLCVProvider,
-    FMPRequest,
-    infer_asset_class,
-)
-from openbb_pine.runtime.fmp_retry import call_with_retry
 from openbb_pine.runtime.secondary_cache import SecondarySeriesCache
 
 if TYPE_CHECKING:  # pragma: no cover -- typing-only
     from openbb_pine.compiler.types import SecurityContext
+    from openbb_pine.runtime._data_provider_stub import _DataProviderStub
 
 
 __all__ = [
@@ -102,8 +112,8 @@ def _context_is_dynamic(ctx: "SecurityContext") -> bool:
     ``SecurityContext``, but the Wave-1 ``SecurityContext`` dataclass
     (owned by bead ``d75``) doesn't have them yet. Until it does, this
     helper always returns False (treat every context as static and route to
-    FMP). The ``getattr`` fallback means once bead ``d75`` adds the fields,
-    this file starts honouring them without a change.
+    the provider). The ``getattr`` fallback means once bead ``d75`` adds
+    the fields, this file starts honouring them without a change.
 
     TODO(d75): remove the ``getattr`` fallback once ``SecurityContext`` has
     ``dynamic_symbol`` / ``dynamic_timeframe`` fields. Follow-up bead
@@ -120,25 +130,20 @@ def _context_is_dynamic(ctx: "SecurityContext") -> bool:
 # --- Bar-window inference for cache key --------------------------------------
 
 
-def _extract_window(
-    primary: FMPRequest | pd.DataFrame,
-) -> tuple[Any, Any]:
+def _extract_window(primary: pd.DataFrame) -> tuple[Any, Any]:
     """Return ``(start_bar, end_bar)`` for the cache key.
 
-    * ``pd.DataFrame`` primary → use the first / last index values.
-    * ``FMPRequest`` primary → use ``request.start`` / ``request.end``.
+    An empty frame falls back to a sentinel string ``"?"`` so the cache
+    key stays deterministic.
 
-    Missing endpoints (empty frame, ``None`` start/end) fall back to a
-    sentinel string ``"?"`` so the cache key stays deterministic.
+    Note: pre-E0.2 this helper also accepted a request-object primary
+    (from the pre-decoupling concrete-provider path). That branch is gone
+    — the dispatcher only supports DataFrame primaries now (see the
+    ``NotImplementedError`` raise for non-DataFrame primary).
     """
-    if isinstance(primary, pd.DataFrame):
-        if primary.empty:
-            return ("?", "?")
-        return (primary.index[0], primary.index[-1])
-    # FMPRequest branch — start/end may be None (OpenBB's default window).
-    start = primary.start if primary.start is not None else "?"
-    end = primary.end if primary.end is not None else "?"
-    return (start, end)
+    if primary.empty:
+        return ("?", "?")
+    return (primary.index[0], primary.index[-1])
 
 
 # --- Per-context fetch paths -------------------------------------------------
@@ -167,41 +172,32 @@ def _fetch_via_resolver(
         ) from exc
 
 
-def _fetch_via_fmp(
+def _fetch_via_provider(
     context_id: str,
     ctx: "SecurityContext",
-    fmp_provider_template: FMPOHLCVProvider,
+    provider: "_DataProviderStub",
+    *,
+    start: datetime | None,
+    end: datetime | None,
 ) -> pd.DataFrame:
-    """Fetch the secondary via ``FMPOHLCVProvider``, reusing the primary
-    provider's ``provider_used`` (``"fmp"`` / ``"fmp_cached"``) and
-    ``user_settings`` so the secondary honours the same routing decision.
+    """Fetch the secondary via the caller-supplied
+    :class:`_DataProviderStub` (post-E1: real
+    ``pynecore.providers.Provider``).
 
-    Wrapped in :func:`call_with_retry` so a rate-limited or transient FMP
-    failure on ONE secondary consumes the shared retry budget and surfaces
-    as ``PineFMPUnreachableError`` — never a bare ``httpx`` / ``OpenBBError``.
+    The dispatcher no longer knows or cares whether the underlying
+    concrete provider is network-backed, a BYO adapter, or something
+    else — that's the caller's problem. The caller is also responsible
+    for wrapping the ``fetch`` call in any retry envelope, so the
+    dispatcher never surfaces provider-specific transport errors
+    directly from this path — it propagates whatever the
+    caller-installed wrapper raises.
+
+    ``context_id`` and ``ctx`` are accepted for logging / future
+    telemetry hooks, but are not passed to ``provider.fetch`` (whose
+    signature is deliberately kept to the abstract Provider shape).
     """
-    provider_name = fmp_provider_template.provider
-
-    def _do_fetch() -> pd.DataFrame:
-        # Build a fresh FMPRequest for this secondary — the primary
-        # provider's request is for a different symbol/tf.
-        req = FMPRequest(
-            symbol=ctx.symbol,
-            interval=ctx.timeframe,
-            start=None,
-            end=None,
-            asset_class=infer_asset_class(ctx.symbol),
-        )
-        provider = FMPOHLCVProvider(req, provider=provider_name)
-        # Access the DataFrame directly (before OHLCV coercion) — the
-        # dispatcher works in DataFrame-space so alignment / forward-fill
-        # are trivial. ``_fetch`` is deliberately private on
-        # FMPOHLCVProvider today; if it goes public later this call site
-        # stays the same.
-        return provider._fetch()  # noqa: SLF001 -- deliberate cross-module reach
-
-    label = f"secondary:{ctx.symbol}:{ctx.timeframe}[{context_id}]"
-    return call_with_retry(_do_fetch, label=label, provider=provider_name)
+    del context_id  # accepted for symmetry with _fetch_via_resolver
+    return provider.fetch(ctx.symbol, ctx.timeframe, start=start, end=end)
 
 
 # --- Main entry point --------------------------------------------------------
@@ -209,11 +205,13 @@ def _fetch_via_fmp(
 
 def prefetch_security_contexts(
     contexts: dict[str, "SecurityContext"],
-    primary: FMPRequest | pd.DataFrame,
+    primary: pd.DataFrame,
     *,
-    fmp_provider: FMPOHLCVProvider | None,
+    provider: "_DataProviderStub | None",
     data_resolver: Callable[[str, str], pd.DataFrame] | None = None,
     cache: SecondarySeriesCache | None = None,
+    primary_start: datetime | None = None,
+    primary_end: datetime | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Fetch every secondary series before ``ScriptRunner.run_iter()`` starts.
 
@@ -225,26 +223,34 @@ def prefetch_security_contexts(
     Parameters
     ----------
     contexts
-        ``compiled.security_contexts`` — the map C3 populated. If ``None``
-        or empty this function short-circuits to ``{}`` (no fetches, no
-        cache lookups).
+        ``compiled.security_contexts`` — the map C3 populated. If empty
+        this function short-circuits to ``{}`` (no fetches, no cache
+        lookups).
     primary
-        The primary bar grid. Either an ``FMPRequest`` (executor's FMP
-        path) or a ``pd.DataFrame`` (executor's BYO path). See the
-        NotImplementedError path below for the Wave-1 caveat.
-    fmp_provider
-        The already-constructed primary FMPOHLCVProvider. We reuse its
-        ``provider`` (``"fmp"`` / ``"fmp_cached"``) so all secondaries
-        route the same way. ``None`` is legal only when every context has
-        a ``data_resolver`` fallback available.
+        The primary bar grid as a ``pd.DataFrame`` — the executor
+        pre-fetches so we can lean on ``primary.index`` for alignment.
+        Passing anything else raises ``NotImplementedError`` (Wave-1
+        scope).
+    provider
+        The active :class:`_DataProviderStub` supplied by the caller.
+        Post-E1 this becomes ``pynecore.providers.Provider``; for now
+        the caller (executor_shell in E0.3) wraps its concrete data
+        provider in a stub adapter. ``None`` is legal only when every
+        context has a ``data_resolver`` fallback available.
     data_resolver
-        Optional per-context BYO resolver (Python API only; not exposed by
-        REST — D5 §4.3). When supplied it wins over the FMP path, per D5
-        priority order.
+        Optional per-context BYO resolver (Python API only; not exposed
+        by REST — D5 §4.3). When supplied it wins over the provider
+        path, per D5 priority order.
     cache
         Optional :class:`SecondarySeriesCache`. When provided, hits skip
-        both the resolver and the FMP fetch. Misses populate the cache
-        after the fetch completes. ``None`` disables caching.
+        both the resolver and the provider fetch. Misses populate the
+        cache after the fetch completes. ``None`` disables caching.
+    primary_start, primary_end
+        Optional bar-window bounds forwarded to ``provider.fetch``. When
+        omitted, the provider's fetch is invoked with ``start=None`` /
+        ``end=None`` and the concrete provider decides its default
+        window. Not used for cache-key derivation (that still comes from
+        the primary DataFrame's index endpoints).
 
     Priority per D5 §4.2
     --------------------
@@ -252,28 +258,23 @@ def prefetch_security_contexts(
     2. ``data_resolver`` (if supplied).
     3. Dynamic-symbol / dynamic-timeframe → empty DataFrame + warning
        (D5 §4.4 defers per-bar lazy fetch to a follow-up bead).
-    4. ``fmp_provider`` with the shared retry budget.
+    4. ``provider.fetch(...)`` — caller-installed provider stub.
     5. Forward-fill align to primary index.
 
     Raises
     ------
-    PineFMPUnreachableError
-        From :func:`call_with_retry` when the FMP path exhausts its budget.
     PineDataResolverError
         When a user-supplied ``data_resolver`` raises.
     NotImplementedError
-        When ``primary`` is an ``FMPRequest`` (see below).
+        When ``primary`` is not a DataFrame (Wave-1 scope marker).
+    ValueError
+        When a static context has neither a provider nor a resolver
+        available.
 
-    Wave-1 caveat: ``FMPRequest`` primary
-    -------------------------------------
-    The Wave-1 executor call site passes a ``pd.DataFrame`` primary (it
-    fetches the primary before calling us). Handling ``FMPRequest``
-    directly would require this function to fetch the primary itself —
-    duplicating the executor's provider construction path. We raise
-    ``NotImplementedError`` for now with a clear pointer; the follow-up
-    bead that touches ``executor.py`` (``n6j``) can either (a) pass a
-    DataFrame after fetching or (b) extend this function's primary-fetch
-    path. Marked as a TODO in-body.
+    Any exception raised by ``provider.fetch(...)`` propagates
+    unchanged — the caller owns retry / envelope semantics (e.g.
+    wrapping a network-backed provider's ``fetch`` in a retry decorator
+    that emits a typed transport error on budget exhaustion).
     """
     # Fast path: empty / None contexts → no work, no cache calls, no
     # provider validation. Matches D5 spec ("only prefetch when there are
@@ -281,15 +282,16 @@ def prefetch_security_contexts(
     if not contexts:
         return {}
 
-    # TODO(n6j / follow-up executor bead): support ``FMPRequest`` primary.
-    # For Wave 1, only DataFrame primary is required — the executor fetches
-    # the primary before invoking us, so we can lean on ``primary.index``
-    # for alignment.
+    # Wave-1 scope guard: a request-object primary (and any other
+    # non-DataFrame) is not supported. The dispatcher requires the caller
+    # to materialise the primary bar grid before calling us so we can
+    # lean on ``primary.index`` for alignment.
     if not isinstance(primary, pd.DataFrame):
         raise NotImplementedError(
             "prefetch_security_contexts currently supports only a "
-            "pd.DataFrame `primary` (executor pre-fetches). Follow-up "
-            "bead (executor wiring) will extend to FMPRequest primaries."
+            "pd.DataFrame `primary` (executor pre-fetches). Non-DataFrame "
+            "primaries (e.g. a request-builder object) must be "
+            "materialised by the caller before invoking the dispatcher."
         )
 
     primary_index: pd.DatetimeIndex = primary.index  # type: ignore[assignment]
@@ -319,19 +321,25 @@ def prefetch_security_contexts(
             # "no data yet" from "no context" (the key is still present).
             result[context_id] = pd.DataFrame()
             continue
-        # 4) Default: FMP route with shared retry budget.
+        # 4) Default: caller-installed provider stub.
         else:
-            if fmp_provider is None:
-                # Can't route to FMP and no resolver — the caller wired
-                # inconsistent options. Surface a clean error instead of an
-                # ``AttributeError`` later.
+            if provider is None:
+                # Can't route to a provider and no resolver — the caller
+                # wired inconsistent options. Surface a clean error
+                # instead of an ``AttributeError`` later.
                 raise ValueError(
                     f"prefetch_security_contexts: context {context_id!r} "
-                    f"({ctx.symbol!r} @ {ctx.timeframe!r}) requires FMP "
-                    "but no `fmp_provider` was supplied and no "
+                    f"({ctx.symbol!r} @ {ctx.timeframe!r}) requires a "
+                    "data provider but no `provider` was supplied and no "
                     "`data_resolver` fallback is available."
                 )
-            df = _fetch_via_fmp(context_id, ctx, fmp_provider)
+            df = _fetch_via_provider(
+                context_id,
+                ctx,
+                provider,
+                start=primary_start,
+                end=primary_end,
+            )
 
         # 5) Alignment (only for freshly-fetched frames; cached entries
         # were aligned at write time).
@@ -346,9 +354,9 @@ def prefetch_security_contexts(
     return result
 
 
-# --- Utility datetime coercion (mirrors fmp_provider._ts_to_utc_seconds
-#     but the dispatcher operates on frames, not raw ts). Not currently
-#     needed — kept as a private hook for the follow-up FMPRequest path.
+# --- Utility datetime coercion — kept as a private hook for the
+#     follow-up request-object primary path (Wave-1 scope only supports
+#     DataFrame primaries, per the NotImplementedError above).
 def _coerce_datetime(value: Any) -> datetime | None:  # pragma: no cover
     if value is None:
         return None
