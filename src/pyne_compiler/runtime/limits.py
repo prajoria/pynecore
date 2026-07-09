@@ -34,7 +34,7 @@ from contextlib import contextmanager
 from types import FrameType
 from typing import Iterator
 
-from openbb_pine.errors import PineExecTimeoutError
+from openbb_pine.compiler_errors import PineExecTimeoutError
 
 # --- Public constants (D2 section 10.1) ---------------------------------------
 

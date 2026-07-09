@@ -88,7 +88,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 import pandas as pd
 
-from openbb_pine.errors import (
+from openbb_pine.compiler_errors import (
     PineSecurityContextNotFoundError,
     PineUnsupportedBuiltinError,
 )

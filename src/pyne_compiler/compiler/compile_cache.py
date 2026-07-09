@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Any
 
 from openbb_pine.compiler.types import CompiledModule, SecurityContext
-from openbb_pine.errors import PineCacheError
+from openbb_pine.compiler_errors import PineCacheError
 
 __all__ = [
     "DEFAULT_CACHE_DIR",

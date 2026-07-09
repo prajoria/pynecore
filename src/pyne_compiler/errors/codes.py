@@ -31,6 +31,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# NOTE (bead OpenBBTechnical-3cf E0.1 review):
+# Post-split, `compiler_errors` has no top-level import of `error_codes`
+# (verified 2026-07-07) so a top-of-file import here is safe. The prior
+# deferred import inside `assert_code_registered` guarded against a
+# speculative cycle that never materialized. If a future refactor makes
+# `compiler_errors` import from `error_codes`, revert this to a lazy
+# import inside the function to break the cycle.
+from openbb_pine.compiler_errors import PineInternalCompilerError
+
 
 @dataclass(frozen=True, slots=True)
 class ErrorCodeSpec:
@@ -423,11 +432,6 @@ def assert_code_registered(code: str) -> None:
     codebase at CI time.
     """
     if code not in ERROR_CODES:
-        # Deferred import so this module has no import-time dependency on
-        # errors.py (which would create a cycle if error_codes.py grew
-        # richer catalog metadata sourced from the error classes).
-        from openbb_pine.errors import PineInternalCompilerError
-
         raise PineInternalCompilerError(
             rule="IC001",
             invariant=(

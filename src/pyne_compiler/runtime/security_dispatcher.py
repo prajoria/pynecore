@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import pandas as pd
 
-from openbb_pine.errors import PineDataResolverError
+from openbb_pine.compiler_errors import PineDataResolverError
 from openbb_pine.runtime.fmp_provider import (
     FMPOHLCVProvider,
     FMPRequest,
