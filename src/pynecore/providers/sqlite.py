@@ -54,11 +54,14 @@ Clean-room: I have not viewed TradingView or PyneComp source code.
 """
 from __future__ import annotations
 
+import math
 import sqlite3
 import sys
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator
+from urllib.parse import quote
 
 # Python 3.12+ ships ``typing.override``; earlier versions get a no-op
 # decorator so downstream ``@override`` annotations stay valid.
@@ -160,6 +163,43 @@ def _validate_identifier(name: str, kind: str) -> str:
     return name
 
 
+def _coerce_ohlc(value: Any) -> float:
+    """Coerce an OHLC storage value to ``float``, mapping ``None`` to ``nan``.
+
+    SQLite permits NULL in any column regardless of declared type, so a
+    ``float(None)`` on a backfill-gap row would crash the stream. We
+    map NULL to ``math.nan`` because it is:
+
+    - Mathematically neutral in downstream indicators (NaN propagates
+      through arithmetic; consumers can filter with ``math.isnan``).
+    - Consistent with the pynecore convention for "no value" in
+      float-typed fields.
+
+    See PR #4 review, L515.
+    """
+    if value is None:
+        return math.nan
+    return float(value)
+
+
+def _coerce_volume(value: Any) -> float:
+    """Coerce a volume storage value to ``float``, mapping ``None`` to ``-1.0``.
+
+    Volume NULL maps to ``-1.0`` because that is the sentinel
+    :class:`~pynecore.core.ohlcv_file.OHLCVWriter` uses to mark
+    synthetic gap-fill bars — downstream code already treats
+    ``volume <= 0`` as "no trading activity" (see ``ohlcv_file.py``
+    line 575) and skips such bars when ``skip_gaps=True``. Preserving
+    that contract means a NULL-volume DB row surfaces as a gap-fill
+    bar rather than crashing the stream.
+
+    See PR #4 review, L515.
+    """
+    if value is None:
+        return -1.0
+    return float(value)
+
+
 class SQLiteProvider(Provider):
     """Read OHLCV bars from a user-supplied SQLite database.
 
@@ -180,6 +220,11 @@ class SQLiteProvider(Provider):
         the ``.ohlcv`` file path that this provider does not write).
     :param config_dir: Optional; if provided and ``providers.toml``
         exists in it, config values there are consulted for defaults.
+        NOTE: unlike other providers, SQLiteProvider does NOT derive
+        ``config_dir`` from ``ohlv_dir`` — the whole point of this
+        provider is ad-hoc DB access without an OpenBB install, so
+        ``providers.toml`` auto-discovery is opt-in via this explicit
+        argument. See PR #4 review, L275.
     :param table_name: Override the OHLCV table name (default ``"ohlcv"``).
     :param symbol_column: Column holding the symbol (default ``"symbol"``).
     :param timeframe_column: Column holding the timeframe, or ``None``
@@ -252,12 +297,20 @@ class SQLiteProvider(Provider):
         close_column: str | None = None,
         volume_column: str | None = None,
     ) -> None:
-        # NOTE: we DO NOT call ``super().__init__`` because the parent
-        # constructor unconditionally opens ``providers.toml`` and
-        # refuses to instantiate without an ``ohlv_dir``. Both are noisy
-        # for a "just read a DB" use case. Instead we replicate the
-        # minimum parent bookkeeping needed by API parity, and consult
-        # ``providers.toml`` only when a config_dir is supplied.
+        # NOTE: we intentionally DO NOT call ``super().__init__`` because
+        # the parent constructor unconditionally opens ``providers.toml``
+        # via ``load_config()`` and refuses to instantiate without an
+        # ``ohlv_dir``. SQLiteProvider is designed for the "ad-hoc DB
+        # query without an OpenBB install" use case — the caller passes
+        # an explicit ``db_path`` and does NOT rely on ``providers.toml``
+        # auto-discovery from ``ohlv_dir``. If you provisioned
+        # ``~/.openbb_platform/config/providers.toml`` with a ``[sqlite]``
+        # section and expected auto-discovery, you must pass ``config_dir``
+        # explicitly here — SQLiteProvider does not derive it from
+        # ``ohlv_dir`` the way other providers do (see PR #4 review, L275).
+        # We replicate the minimum parent bookkeeping needed for API
+        # parity, and consult ``providers.toml`` only when ``config_dir``
+        # is supplied AND the file actually exists.
         self.symbol = symbol
         self.timeframe = timeframe
         self.xchg_timeframe = timeframe  # no translation for SQLite
@@ -347,7 +400,13 @@ class SQLiteProvider(Provider):
         :return: List of symbol strings in insertion order (no sort;
             caller can sort if stable ordering is needed).
         """
-        with self._connect() as conn:
+        # ``contextlib.closing`` guarantees ``conn.close()`` even on
+        # exception — ``sqlite3.Connection.__exit__`` alone only commits
+        # or rolls back, it does NOT close (Python docs, "Connection
+        # context manager"). Leaving the connection open holds the file
+        # lock, which on Windows blocks subsequent ``os.unlink(db)``
+        # with ``PermissionError: WinError 32`` (see PR #4 review L497).
+        with closing(self._connect()) as conn:
             cur = conn.execute(
                 f"SELECT DISTINCT {self._sym_col} FROM {self._table}"
             )
@@ -437,7 +496,16 @@ class SQLiteProvider(Provider):
         :param include_gaps: Accepted for API parity with
             :meth:`Provider.stream`. SQLite has no gap-fill semantics
             (no ``volume=-1`` sentinel rows) so the flag is a no-op.
+            NOTE: rows with ``NULL`` volume in the DB are surfaced as
+            gap-fill bars (``volume=-1.0``) — see the NULL-handling
+            note below — so ``include_gaps=False`` will NOT hide them
+            here, unlike the file-backed :meth:`Provider.stream`. The
+            SQLite override does not re-run the gap filter; downstream
+            can post-filter on ``volume <= 0`` if needed.
         :yields: :class:`OHLCV` rows in ascending timestamp order.
+            NULL OHLC values are surfaced as ``math.nan`` and NULL
+            volume as ``-1.0`` (gap-fill sentinel) — see
+            :func:`_coerce_ohlc` / :func:`_coerce_volume` for rationale.
         :raises TypeError: If ``start`` or ``end`` is naive.
         """
         # Guard: naive datetimes silently interpret in local tz — a cross-
@@ -490,11 +558,17 @@ class SQLiteProvider(Provider):
             f"ORDER BY {self._ts_col} ASC"
         )
 
-        # ``with self._connect()`` closes the connection when the
-        # generator is exhausted OR garbage-collected mid-iteration
-        # (Python guarantees the finally-block runs when the generator
-        # is closed). Missing DB rows return no results without raising.
-        with self._connect() as conn:
+        # ``contextlib.closing`` guarantees ``conn.close()`` runs when
+        # the generator is exhausted, garbage-collected mid-iteration,
+        # or ``.close()``d explicitly (Python guarantees the finally
+        # branch of a generator runs on close). CRITICAL: ``sqlite3.
+        # Connection.__exit__`` alone only commits/rolls back, it does
+        # NOT close the connection (Python docs, "Connection context
+        # manager"). Without ``closing()`` the file lock persists past
+        # generator abandonment, blocking ``os.unlink(db)`` on Windows
+        # with ``PermissionError: WinError 32`` — reproduced in PR #4
+        # review, L497. Missing DB rows return no results without raising.
+        with closing(self._connect()) as conn:
             cur = conn.execute(sql, params)
             # Iterate cursor lazily so a million-row query does not
             # materialise into memory. ``fetchmany`` could tune the
@@ -506,13 +580,24 @@ class SQLiteProvider(Provider):
                 # column authored as INTEGER can silently deliver a
                 # Python ``int`` where the OHLCV NamedTuple expects a
                 # float. int() / float() normalise before yielding.
+                #
+                # NULL handling (PR #4 review, L515): a row with NULL
+                # in any OHLCV column would crash ``float(None)`` with
+                # ``TypeError``. Real-world backfill-gap DBs routinely
+                # carry NULL close/volume. We match the ``.ohlcv`` file
+                # format's gap-fill convention: OHLC become ``nan``
+                # (mathematically neutral in downstream indicators via
+                # NaN propagation) and volume becomes ``-1`` (the same
+                # sentinel :class:`OHLCVWriter` uses to mark synthetic
+                # gap-fill bars — downstream skips them when volume<=0).
+                # The timestamp is required and never coerced.
                 yield OHLCV(
                     timestamp=int(row[0]),
-                    open=float(row[1]),
-                    high=float(row[2]),
-                    low=float(row[3]),
-                    close=float(row[4]),
-                    volume=float(row[5]),
+                    open=_coerce_ohlc(row[1]),
+                    high=_coerce_ohlc(row[2]),
+                    low=_coerce_ohlc(row[3]),
+                    close=_coerce_ohlc(row[4]),
+                    volume=_coerce_volume(row[5]),
                 )
 
     @override
@@ -570,6 +655,13 @@ class SQLiteProvider(Provider):
             opened (missing / permissions / not a valid SQLite DB).
         """
         # ``as_posix()`` because sqlite3 URI parsing on Windows chokes on
-        # backslashes even in the file: prefix.
-        uri = f"file:{self._db_path.as_posix()}?mode=ro"
+        # backslashes even in the file: prefix. ``urllib.parse.quote``
+        # then percent-encodes ``?`` and ``#`` (both legal in POSIX
+        # filenames), which would otherwise be silently misinterpreted as
+        # the URI query / fragment delimiters — e.g. ``/tmp/foo?bar.db``
+        # would open ``/tmp/foo`` with query params ``bar.db=<empty>``
+        # instead of the intended file. ``safe="/"`` preserves path
+        # separators (which are legal in URIs). See PR #4 review, L574.
+        encoded_path = quote(self._db_path.as_posix(), safe="/:")
+        uri = f"file:{encoded_path}?mode=ro"
         return sqlite3.connect(uri, uri=True)
