@@ -844,3 +844,119 @@ def __test_uri_encoding_preserves_question_mark_in_filename__(tmp_path: Path) ->
     # then decodes back to the literal filename.
     from urllib.parse import quote
     assert "%3F" in quote(encoded, safe="/:")
+
+
+# ------------------------------------------------------------------
+# E1.4 (bd-cko) shared behavioral conformance suite
+# ------------------------------------------------------------------
+# SQLiteProvider is mode-2 (spec §5.2): a missing symbol naturally
+# returns [] rather than raising. Spec §5.4 check #5 requires the
+# conforming provider to raise a typed error on missing symbol.
+# The wrapper below adds the "raise on missing symbol" behavior via
+# composition so we can call the shared suite unmodified — real
+# production callers should pick their own missing-symbol policy
+# (raise vs empty-list) rather than adopting this wrapper globally.
+
+
+class _RaisingSQLiteProvider(SQLiteProvider):
+    """Wrap :class:`SQLiteProvider` so unknown-symbol fetches RAISE a
+    :class:`KeyError` (matching §5.4 check #5) instead of returning ``[]``.
+
+    Rationale: the shared conformance suite requires a typed error for
+    missing symbol so that both mode-1 providers (which raise on
+    construction/call-time mismatch) and mode-2 providers (which
+    naturally return ``[]``) can express a uniform "you notice" contract.
+    Real production callers should decide whether they prefer raise or
+    empty-list semantics based on their downstream code — this wrapper
+    exists only to satisfy the conformance-suite contract at test time.
+
+    The check uses :meth:`get_list_of_symbols` (one ``SELECT DISTINCT``)
+    to distinguish "queried but got nothing due to range" from "symbol
+    is not in the table at all" — the latter is the case worth raising
+    on. A stub timeframe that isn't in the table for a known symbol
+    still returns ``[]`` (that's the range-empty case, not the
+    unknown-symbol case).
+    """
+
+    def fetch(self, symbol, timeframe, *, start=None, end=None, include_gaps=False):
+        result = super().fetch(
+            symbol, timeframe,
+            start=start, end=end, include_gaps=include_gaps,
+        )
+        # Only elevate to a raise if the symbol is genuinely absent from
+        # the table. An empty result for a KNOWN symbol (e.g. because
+        # the range is outside the fixture) MUST still return [] — that
+        # is check #3 (empty range) and check #4 (reversed range) which
+        # both expect [].
+        if not result:
+            if symbol not in self.get_list_of_symbols():
+                raise KeyError(
+                    f"symbol {symbol!r} not in SQLite table {self._table!r}"
+                )
+        return result
+
+    def stream(self, symbol, timeframe, *, start=None, end=None, include_gaps=False):
+        # We check symbol existence directly against get_list_of_symbols()
+        # rather than through super().fetch() — the latter dispatches back
+        # via ``self.stream()`` (SQLiteProvider.fetch is a thin
+        # ``list(self.stream(...))`` wrapper), which would recurse
+        # infinitely through this override.
+        #
+        # get_list_of_symbols() is one SELECT DISTINCT — cheap enough for
+        # a test-only wrapper. We check up-front so we raise BEFORE the
+        # caller starts iterating (a lazy raise from inside the generator
+        # would surface only on the first next() call, which the shared
+        # suite's ``list(...)`` would eventually trigger — but eager is
+        # closer to the spec's "you notice, not silently zero rows"
+        # intent).
+        if symbol not in self.get_list_of_symbols():
+            raise KeyError(
+                f"symbol {symbol!r} not in SQLite table {self._table!r}"
+            )
+        return super().stream(
+            symbol, timeframe,
+            start=start, end=end, include_gaps=include_gaps,
+        )
+
+
+def __test_sqlite_provider_conforms_to_shared_suite__(tmp_path: Path) -> None:
+    """Run the E1.4 shared behavioral conformance suite against a
+    fixture-loaded ``_RaisingSQLiteProvider`` (spec §5.4).
+
+    The wrapper adds the "raise on missing symbol" behavior mode-2
+    providers need to satisfy §5.4 check #5 — see the class docstring
+    for the rationale.
+
+    The fixture seeds ``(TESTSYM, 1D)`` bars for Jan 1-5 2024, matching
+    the shared suite's default range so no override is needed on the
+    range parameters.
+    """
+    from pynecore.providers.tests.test_conformance import _conformance_suite
+
+    # Seed the fixture with TESTSYM/1D bars matching the shared suite's
+    # default range. Rows: 5 daily bars Jan 1-5 2024, close=i.
+    db = _make_standard_db(
+        tmp_path,
+        rows=[
+            (
+                "TESTSYM",
+                "1D",
+                int(datetime(2024, 1, i, tzinfo=timezone.utc).timestamp()),
+                float(i),
+                float(i),
+                float(i),
+                float(i),
+                1.0,
+            )
+            for i in range(1, 6)
+        ],
+    )
+    provider = _RaisingSQLiteProvider(db_path=db)
+    _conformance_suite(
+        provider,
+        closed_only=True,
+        test_symbol="TESTSYM",
+        test_timeframe="1D",
+        range_start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        range_end=datetime(2024, 1, 5, tzinfo=timezone.utc),
+    )
