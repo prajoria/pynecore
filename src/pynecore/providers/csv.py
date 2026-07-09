@@ -8,13 +8,26 @@ would be wasted I/O.
 
 CSV format (RFC 4180 with header row):
     timestamp,open,high,low,close,volume
-    - timestamp: UTC epoch seconds (int)
+    - timestamp: UTC epoch seconds. Accepted forms:
+        * integer string (``"1704067200"``)
+        * float string (``"1704067200.5"``) — truncated to int seconds
+        * ISO 8601 string (``"2024-01-01T00:00:00+00:00"``) — a trailing
+          ``Z`` is accepted; naive ISO strings are treated as UTC. The
+          value is converted to epoch seconds.
     - open/high/low/close: float
     - volume: float or int
 
-Rows are assumed already sorted by timestamp ascending; the provider does
-not sort. Malformed rows raise ``ValueError`` with the offending line
-number so operators can locate the bad row without a bisect.
+The file is opened with ``utf-8-sig`` so a leading BOM (common in Excel
+exports) is transparently stripped and does not corrupt the ``timestamp``
+header name.
+
+Unsorted CSVs are supported: the range filter scans the whole file. A
+future optimization may add a fast-path ``break`` when the reader
+detects a strictly-ascending prefix, but the current implementation
+prefers correctness over a micro-optimization that silently drops rows
+when the assumption is violated (e.g. a user concatenated two files).
+Malformed rows raise ``ValueError`` with the offending line number so
+operators can locate the bad row without a bisect.
 
 Mode-1 (instance-scoped) per spec §5.2 — one file, one ``(symbol,
 timeframe)``. Call-time ``(symbol, timeframe)`` mismatches raise the
@@ -24,7 +37,7 @@ behavior aligned across providers.
 from __future__ import annotations
 
 import csv as _csv
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -130,12 +143,63 @@ class CSVProvider(Provider):
     # Direct-CSV reading — overrides Provider.stream / Provider.fetch
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _parse_timestamp(raw: str) -> int:
+        """Parse a ``timestamp`` cell into UTC epoch seconds.
+
+        Accepts three forms in this order:
+
+        1. Integer string — ``"1704067200"``. Fast path, exact.
+        2. Float string — ``"1704067200.5"``. Truncated to ``int``
+           seconds (bar granularity is seconds; sub-second precision
+           has no meaning for OHLCV bars).
+        3. ISO 8601 datetime — ``"2024-01-01T00:00:00+00:00"``. A
+           trailing ``Z`` is accepted (``datetime.fromisoformat`` gained
+           ``Z`` support in Python 3.11 — normalized here for 3.10
+           parity). A naive ISO string (no offset) is treated as UTC,
+           matching the "epoch seconds are UTC" convention of the file
+           format.
+
+        Anything that fails all three parses raises ``ValueError`` — the
+        caller wraps it with the offending line number.
+        """
+        # 1) Integer fast-path.
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+        # 2) Float — truncate to int seconds.
+        try:
+            return int(float(raw))
+        except ValueError:
+            pass
+        # 3) ISO 8601. Normalize trailing "Z" for 3.10 (fromisoformat
+        # accepts "Z" only from 3.11). If the parsed datetime is naive,
+        # attach UTC — the file format contract is "UTC epoch seconds".
+        iso = raw.strip()
+        if iso.endswith("Z"):
+            iso = iso[:-1] + "+00:00"
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+
     def _iter_csv_bars(self) -> Iterator[OHLCV]:
         """Yield every OHLCV row from the CSV, unfiltered."""
-        with self._csv_path.open("r", newline="", encoding="utf-8") as f:
+        # ``utf-8-sig`` transparently strips a leading BOM (Excel and
+        # many .NET tools prepend ``\xEF\xBB\xBF``), which would
+        # otherwise become part of the first header name and break the
+        # ``"timestamp" in fieldnames`` check.
+        with self._csv_path.open("r", newline="", encoding="utf-8-sig") as f:
             reader = _csv.DictReader(f)
+            # Zero-byte file → no fieldnames at all. Treat identically
+            # to the missing-file case (``[]``) rather than raising a
+            # confusing "missing columns" error for what is really
+            # "there is no data here."
+            if not reader.fieldnames:
+                return
             required = {"timestamp", "open", "high", "low", "close", "volume"}
-            missing = required - set(reader.fieldnames or [])
+            missing = required - set(reader.fieldnames)
             if missing:
                 raise ValueError(
                     f"CSVProvider: {self._csv_path} missing columns: "
@@ -145,7 +209,7 @@ class CSVProvider(Provider):
             for lineno, row in enumerate(reader, start=2):
                 try:
                     yield OHLCV(
-                        timestamp=int(row["timestamp"]),
+                        timestamp=self._parse_timestamp(row["timestamp"]),
                         open=float(row["open"]),
                         high=float(row["high"]),
                         low=float(row["low"]),
@@ -177,7 +241,11 @@ class CSVProvider(Provider):
         - Naive datetimes → ``TypeError`` (spec §5).
         - ``start > end`` → yield nothing (spec §5.4 check #4).
         - Missing CSV file → yield nothing (spec §5.4 check #3).
+        - Empty CSV file → yield nothing (symmetry with missing file).
         - Bounds are inclusive on both sides.
+
+        The CSV is not assumed sorted: the whole file is scanned per
+        call. See ``_iter_csv_bars`` for details.
         """
         # Guard: mode-1 symbol/timeframe mismatch. Matches Provider.stream.
         if self.symbol is not None and symbol != self.symbol:
@@ -226,8 +294,13 @@ class CSVProvider(Provider):
             if start_ts is not None and bar.timestamp < start_ts:
                 continue
             if end_ts is not None and bar.timestamp > end_ts:
-                # Rows are pre-sorted ascending — safe to short-circuit.
-                break
+                # ``continue`` rather than ``break``: the CSV is not
+                # guaranteed sorted (a user may have concatenated two
+                # files), and a short-circuit would silently drop
+                # in-range rows that come after a stray large timestamp.
+                # See PR #3 review — correctness over the O(range)
+                # early-exit optimization.
+                continue
             yield bar
 
     def fetch(  # type: ignore[override]

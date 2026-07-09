@@ -294,3 +294,102 @@ def __test_csv_provider_malformed_row_raises_with_line_number__(tmp_path: Path) 
     provider = _make(tmp_path, csv_path=bad)
     with pytest.raises(ValueError, match=r":3"):
         list(provider.stream("TESTSYM", "1D"))
+
+
+#
+# PR #3 review regressions
+#
+
+def __test_csv_provider_strips_utf8_bom__(tmp_path: Path) -> None:
+    """Excel-exported CSVs start with a UTF-8 BOM (``\\xEF\\xBB\\xBF``).
+    ``utf-8-sig`` strips it transparently — without the fix the first
+    header becomes ``﻿timestamp`` and the missing-columns check
+    trips."""
+    bom = tmp_path / "bom.csv"
+    # Prepend BOM to the header row — exactly what Excel writes.
+    bom.write_bytes(
+        b"\xef\xbb\xbf"
+        + b"timestamp,open,high,low,close,volume\n"
+        + b"1704067200,100.0,101.5,99.0,101.0,1000\n"
+    )
+    provider = _make(tmp_path, csv_path=bom)
+    bars = provider.fetch("TESTSYM", "1D")
+    assert len(bars) == 1
+    assert bars[0].timestamp == 1704067200
+
+
+def __test_csv_provider_accepts_float_timestamp__(tmp_path: Path) -> None:
+    """Float epoch strings (``"1704067200.5"``) are truncated to int
+    seconds rather than raising."""
+    float_ts = tmp_path / "float.csv"
+    float_ts.write_text(
+        "timestamp,open,high,low,close,volume\n"
+        "1704067200.5,100.0,101.5,99.0,101.0,1000\n"
+        "1704153600.0,101.0,102.0,100.5,101.5,1100\n",
+        encoding="utf-8",
+    )
+    provider = _make(tmp_path, csv_path=float_ts)
+    bars = provider.fetch("TESTSYM", "1D")
+    assert len(bars) == 2
+    # Sub-second is truncated (int(1704067200.5) == 1704067200).
+    assert bars[0].timestamp == 1704067200
+    assert bars[1].timestamp == 1704153600
+
+
+def __test_csv_provider_accepts_iso8601_timestamp__(tmp_path: Path) -> None:
+    """ISO 8601 strings are parsed to UTC epoch seconds — with explicit
+    offset, trailing ``Z``, and naive (treated as UTC)."""
+    iso = tmp_path / "iso.csv"
+    iso.write_text(
+        "timestamp,open,high,low,close,volume\n"
+        "2024-01-01T00:00:00+00:00,100.0,101.5,99.0,101.0,1000\n"
+        "2024-01-02T00:00:00Z,101.0,102.0,100.5,101.5,1100\n"
+        "2024-01-03T00:00:00,101.5,103.0,101.0,102.5,1200\n",  # naive → UTC
+        encoding="utf-8",
+    )
+    provider = _make(tmp_path, csv_path=iso)
+    bars = provider.fetch("TESTSYM", "1D")
+    assert len(bars) == 3
+    assert bars[0].timestamp == 1704067200  # 2024-01-01 UTC
+    assert bars[1].timestamp == 1704153600  # 2024-01-02 UTC
+    assert bars[2].timestamp == 1704240000  # 2024-01-03 UTC
+
+
+def __test_csv_provider_empty_file_returns_empty__(tmp_path: Path) -> None:
+    """A zero-byte file is a real-but-empty file — treat it as no data
+    (return ``[]``) rather than the confusing ``missing columns``
+    ValueError. Symmetry with the missing-file case."""
+    empty = tmp_path / "zero.csv"
+    empty.write_bytes(b"")
+    provider = _make(tmp_path, csv_path=empty)
+    assert provider.fetch("TESTSYM", "1D") == []
+    assert list(provider.stream("TESTSYM", "1D")) == []
+
+
+def __test_csv_provider_unsorted_rows_no_short_circuit__(tmp_path: Path) -> None:
+    """Regression for PR #3 [BUG] csv.py:229 — an early stray large
+    timestamp must NOT cause later in-range rows to be silently dropped.
+
+    Before the fix (``break``), a range ending at Jan 3 returned 0 bars
+    because the Jan 5 row appeared first and short-circuited the loop.
+    After the fix (``continue``), the full file is scanned and the two
+    Jan 1/2 rows are returned."""
+    unsorted_csv = tmp_path / "unsorted.csv"
+    unsorted_csv.write_text(
+        "timestamp,open,high,low,close,volume\n"
+        # Stray large timestamp first (Jan 5) — would short-circuit.
+        "1704412800,103.5,105.0,103.0,104.5,1400\n"
+        "1704067200,100.0,101.5,99.0,101.0,1000\n"  # Jan 1
+        "1704153600,101.0,102.0,100.5,101.5,1100\n",  # Jan 2
+        encoding="utf-8",
+    )
+    provider = _make(tmp_path, csv_path=unsorted_csv)
+    bars = provider.fetch(
+        "TESTSYM", "1D",
+        start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        end=datetime(2024, 1, 3, tzinfo=timezone.utc),
+    )
+    # Both in-range rows returned, in file order (we don't sort).
+    assert len(bars) == 2
+    assert bars[0].timestamp == 1704067200
+    assert bars[1].timestamp == 1704153600
