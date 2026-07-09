@@ -34,22 +34,35 @@ def test_bridge_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(pynecore_bridge, "is_pynecore_installed", lambda: False)
     before = list(sys.path)
+    # Simulate a clean pre-bridge state: the bridge fires at openbb_pine
+    # import time (in openbb_pine/__init__.py), so by the time this test
+    # runs src_dir is already in sys.path. Remove it so the assertion
+    # tests the actual prepend behavior, not a no-op from the dedup guard.
+    src_dir = str(pynecore_bridge._submodule_src_dir())
+    sys.path[:] = [p for p in before if p != src_dir]
+    baseline = list(sys.path)
     try:
         pynecore_bridge.install_pynecore_path()
         pynecore_bridge.install_pynecore_path()
         pynecore_bridge.install_pynecore_path()
 
-        src_dir = str(pynecore_bridge._submodule_src_dir())
         # Exactly one — this is the dedup assertion, meaningful because we
-        # forced the mutation branch above.
+        # forced the mutation branch (monkeypatch) AND ensured the initial
+        # sys.path didn't already contain src_dir.
         assert sys.path.count(src_dir) == 1
-        # Prepended, not appended — pynecore-shadowing search order matters.
-        assert sys.path[0] == src_dir
+        # Prepended at index 0 — pynecore-shadowing search order matters.
+        # Now safe to assert directly because we ensured a clean baseline
+        # (no pytest-injected src_dir competing for position 0).
+        assert sys.path[0] == src_dir, (
+            f"expected src_dir {src_dir!r} at sys.path[0], "
+            f"found {sys.path[0]!r} (bridge failed to prepend)"
+        )
         # Nothing else got inserted.
-        extra = [p for p in sys.path if p not in before and p != src_dir]
+        extra = [p for p in sys.path if p not in baseline and p != src_dir]
         assert extra == [], f"bridge inserted unexpected paths: {extra}"
     finally:
-        # Don't leak the insert to sibling tests.
+        # Don't leak the insert to sibling tests. Restore ORIGINAL before,
+        # not baseline (which had src_dir removed for the test).
         sys.path[:] = before
 
 
