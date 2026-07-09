@@ -656,6 +656,13 @@ class TestTelemetryCounters:
 
 
 class TestTelemetryIntegration:
+    """Post-E0.4 integration: the compiler emits to the INJECTED sink
+    (not the module-global default). These tests exercise the plumbing
+    inside ``_TypeChecker`` / ``_CodegenVisitor`` — the full end-to-end
+    ``compile_pine(telemetry=sink)`` wiring is covered in
+    ``test_telemetry_injection.py``.
+    """
+
     def setup_method(self) -> None:
         from openbb_pine.telemetry import reset_metrics
 
@@ -663,29 +670,34 @@ class TestTelemetryIntegration:
 
     def test_type_checker_raise_records_builtin(self) -> None:
         """The C3 type checker's ``_raise_unsupported_builtin`` MUST call
-        ``record_unsupported_builtin(name)`` before raising, so PRD §3.4 L0.5
-        wild-corpus coverage attribution stays accurate."""
+        ``sink.record_unsupported_builtin(name)`` on the injected sink
+        before raising, so PRD §3.4 L0.5 wild-corpus coverage attribution
+        stays accurate (E0.4: routed through the injected TelemetrySink
+        instead of the pre-E0.4 module-global recorder)."""
         from openbb_pine.compiler.type_checker import _TypeChecker
         from openbb_pine.errors import PineUnsupportedBuiltinError
-        from openbb_pine.telemetry import get_unsupported_builtin_counts
+        from openbb_pine.telemetry import OpenBBTelemetrySink
 
-        tc = _TypeChecker(pine_version=6)
+        sink = OpenBBTelemetrySink()
+        tc = _TypeChecker(pine_version=6, telemetry=sink)
         with pytest.raises(PineUnsupportedBuiltinError):
             tc._raise_unsupported_builtin(
                 "ta.ichimoku",
                 node=_make_dummy_ir_node(),
             )
-        counts = get_unsupported_builtin_counts()
-        assert counts.get("ta.ichimoku", 0) >= 1
+        assert sink.get_unsupported_builtin_counts().get("ta.ichimoku", 0) >= 1
 
     def test_codegen_pf010_records_feature(self) -> None:
         """visit_Program's PF010 strategy-deferral raise MUST call
-        ``record_unsupported_feature('PF010')`` before raising."""
+        ``sink.record_unsupported_feature('PF010')`` on the injected sink
+        before raising (E0.4: routed through the injected TelemetrySink
+        instead of the pre-E0.4 module-global recorder)."""
         from openbb_pine.compiler import ir
         from openbb_pine.compiler.codegen import _CodegenVisitor
         from openbb_pine.errors import PineUnsupportedFeatureError
-        from openbb_pine.telemetry import get_unsupported_feature_counts
+        from openbb_pine.telemetry import OpenBBTelemetrySink
 
+        sink = OpenBBTelemetrySink()
         span = _make_dummy_span()
         directive = ir.ScriptDirective(
             loc=span,
@@ -703,9 +715,10 @@ class TestTelemetryIntegration:
             body=(),
         )
         with pytest.raises(PineUnsupportedFeatureError):
-            _CodegenVisitor(builtins_used=frozenset(), pine_version=6).visit_Program(prog)
-        counts = get_unsupported_feature_counts()
-        assert counts.get("PF010", 0) >= 1
+            _CodegenVisitor(
+                builtins_used=frozenset(), pine_version=6, telemetry=sink
+            ).visit_Program(prog)
+        assert sink.get_unsupported_feature_counts().get("PF010", 0) >= 1
 
 
 def _make_dummy_span():

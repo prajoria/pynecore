@@ -48,8 +48,17 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from openbb_pine.errors import PineUnsupportedFeatureError
+
+if TYPE_CHECKING:  # pragma: no cover — imports for typing only
+    # E2 will rewrite this import to ``from pyne_compiler.telemetry
+    # import TelemetrySink``. Kept behind TYPE_CHECKING so the compiler
+    # never actually imports ``openbb_pine.telemetry`` at runtime — the
+    # E0.4 injection contract (see plan Task E0.4, Step 5 and design doc
+    # §6.E0.4; the ``openbb_pine.telemetry`` module docstring recaps it).
+    from openbb_pine.telemetry import TelemetrySink
 
 __all__ = [
     "V5Rewrite",
@@ -271,7 +280,9 @@ _PRAGMA_PATTERN: re.Pattern[str] = re.compile(
 )
 
 
-def detect_pine_version(source: str) -> int:
+def detect_pine_version(
+    source: str, *, telemetry: "TelemetrySink | None" = None
+) -> int:
     """Return 4, 5, or 6 based on the ``//@version=N`` pragma (D1 §1.2).
 
     Defaults to 6 when no pragma is present (consistent with the lexer's
@@ -282,6 +293,12 @@ def detect_pine_version(source: str) -> int:
     Raises :class:`PineUnsupportedFeatureError` for v1-v4 (out of scope per
     PRD §3.3) and for v7+ (we don't speculate ahead). The error carries
     code ``PF001`` (legacy) or ``PF002`` (future) for REST routing.
+
+    ``telemetry`` (E0.4): optional sink. When provided, the PF001/PF002
+    raise paths call ``telemetry.record_unsupported_feature(code)`` on
+    the sink BEFORE raising so an outer ``except`` cannot swallow the
+    telemetry signal. When ``None`` (default), no sink is touched — the
+    caller has opted out of telemetry collection.
 
     Only the first column-0 pragma is considered. Subsequent ``//@version=``
     occurrences are treated as regular comments — matching the lexer's
@@ -299,9 +316,8 @@ def detect_pine_version(source: str) -> int:
     if version in (5, 6):
         return version
     if version < 5:
-        from openbb_pine.telemetry import record_unsupported_feature
-
-        record_unsupported_feature("PF001")
+        if telemetry is not None:
+            telemetry.record_unsupported_feature("PF001")
         raise PineUnsupportedFeatureError(
             message=(
                 f"PF001 Pine v{version} is not supported. The migration shim "
@@ -310,9 +326,8 @@ def detect_pine_version(source: str) -> int:
                 f"specific v{version} script be re-evaluated."
             )
         )
-    from openbb_pine.telemetry import record_unsupported_feature
-
-    record_unsupported_feature("PF002")
+    if telemetry is not None:
+        telemetry.record_unsupported_feature("PF002")
     raise PineUnsupportedFeatureError(
         message=(
             f"PF002 Pine v{version} pragma found, but the compiler targets "
@@ -381,7 +396,9 @@ def _strip_line_comments(source: str) -> str:
     return _LINE_COMMENT.sub("", source)
 
 
-def migrate_v5_to_v6(source: str) -> tuple[str, list[str]]:
+def migrate_v5_to_v6(
+    source: str, *, telemetry: "TelemetrySink | None" = None
+) -> tuple[str, list[str]]:
     """Apply every entry in :data:`V5_REWRITES` to a v5 source string.
 
     Returns ``(new_source, applied_rewrites_log)`` where the log lists
@@ -396,6 +413,10 @@ def migrate_v5_to_v6(source: str) -> tuple[str, list[str]]:
     post-rewrite source still contains a v5-only construct that none of
     :data:`V5_REWRITES` handled. The error names the offending construct
     and points at the tracking URL where users can file a rewrite request.
+
+    ``telemetry`` (E0.4): optional sink. When provided, the PF003 raise
+    path calls ``telemetry.record_unsupported_feature("PF003")`` on the
+    sink BEFORE raising. When ``None`` (default), no sink is touched.
 
     Idempotent for all ``bidi_safe=True`` rewrites (every shipped rewrite
     is). Calling ``migrate_v5_to_v6(migrate_v5_to_v6(src)[0])`` returns
@@ -431,9 +452,8 @@ def migrate_v5_to_v6(source: str) -> tuple[str, list[str]]:
     scan_target = _strip_line_comments(out)
     for unhandled_pat, feature in _UNHANDLED_V5_PATTERNS:
         if unhandled_pat.search(scan_target):
-            from openbb_pine.telemetry import record_unsupported_feature
-
-            record_unsupported_feature("PF003")
+            if telemetry is not None:
+                telemetry.record_unsupported_feature("PF003")
             raise PineUnsupportedFeatureError(
                 message=(
                     f"PF003 v5 {feature} not yet migrated to v6: the regex "

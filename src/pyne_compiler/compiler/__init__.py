@@ -64,7 +64,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from openbb_pine import __version__
 from openbb_pine.compiler import ir
@@ -86,6 +86,14 @@ from openbb_pine.compiler.v5_migration import (
     migrate_v5_to_v6,
 )
 
+if TYPE_CHECKING:  # pragma: no cover — imports for typing only
+    # E2 will rewrite this import to ``from pyne_compiler.telemetry
+    # import TelemetrySink``. Kept behind TYPE_CHECKING so the compiler
+    # never actually imports ``openbb_pine.telemetry`` at runtime — the
+    # E0.4 injection contract (see plan Task E0.4, Step 5 and design doc
+    # §6.E0.4; the ``openbb_pine.telemetry`` module docstring recaps it).
+    from openbb_pine.telemetry import TelemetrySink
+
 __all__ = [
     "Token",
     "tokenize",
@@ -103,17 +111,25 @@ __all__ = [
 ]
 
 
-def _detect_and_migrate(source: str, target_version: int) -> tuple[str, int]:
+def _detect_and_migrate(
+    source: str,
+    target_version: int,
+    *,
+    telemetry: "TelemetrySink | None" = None,
+) -> tuple[str, int]:
     """Shared detect-and-migrate prelude for both facades.
 
     Returns ``(possibly_migrated_source, final_version)``. Raises
     :class:`PineUnsupportedFeatureError` for unsupported version pairs.
+    Threads the injected ``telemetry`` sink (E0.4) into
+    :func:`detect_pine_version` and :func:`migrate_v5_to_v6` so PF001 /
+    PF002 / PF003 raise paths record on the caller's sink.
     """
     if target_version not in (5, 6):
         from openbb_pine.errors import PineUnsupportedFeatureError
-        from openbb_pine.telemetry import record_unsupported_feature
 
-        record_unsupported_feature("PF002")
+        if telemetry is not None:
+            telemetry.record_unsupported_feature("PF002")
         raise PineUnsupportedFeatureError(
             message=(
                 f"PF002 compile_pine: target_version={target_version!r} is "
@@ -123,14 +139,14 @@ def _detect_and_migrate(source: str, target_version: int) -> tuple[str, int]:
             )
         )
 
-    detected = detect_pine_version(source)
+    detected = detect_pine_version(source, telemetry=telemetry)
 
     # Apply migration when source < target. v6→v5 down-migration is not
     # supported (PRD §3.3 non-goal); the call still passes through so the
     # parser surfaces the inevitable v5-grammar miss with a normal
     # PineSyntaxError if it ever happens.
     if detected == 5 and target_version == 6:
-        source, _rewrites_log = migrate_v5_to_v6(source)
+        source, _rewrites_log = migrate_v5_to_v6(source, telemetry=telemetry)
         # The log is dropped here — the REST `/pine/compile` endpoint
         # (D3 §4.6) re-runs migrate_v5_to_v6 directly when it wants to
         # surface the log to the user. Keeping compile_pine's return
@@ -141,9 +157,9 @@ def _detect_and_migrate(source: str, target_version: int) -> tuple[str, int]:
         # if we reach here it's the supported-pair-mismatch case
         # (e.g. detected=6 but target=5, which we don't support).
         from openbb_pine.errors import PineUnsupportedFeatureError
-        from openbb_pine.telemetry import record_unsupported_feature
 
-        record_unsupported_feature("PF002")
+        if telemetry is not None:
+            telemetry.record_unsupported_feature("PF002")
         raise PineUnsupportedFeatureError(
             message=(
                 f"PF002 compile_pine: source is v{detected}, requested "
@@ -156,7 +172,11 @@ def _detect_and_migrate(source: str, target_version: int) -> tuple[str, int]:
 
 
 def compile_pine_to_program(
-    source: str, *, target_version: int = 6, type_check: bool = True
+    source: str,
+    *,
+    target_version: int = 6,
+    type_check: bool = True,
+    telemetry: "TelemetrySink | None" = None,
 ) -> "ir.Program":
     """Parse [+ type-check] ``source``, returning the IR :class:`Program`.
 
@@ -186,6 +206,11 @@ def compile_pine_to_program(
         re-litigate a (known-incomplete) C3 forward-declaration limitation.
         The ``False`` path is intentionally narrow: production callers
         should use :func:`compile_pine` which always type-checks.
+    telemetry
+        Optional :class:`TelemetrySink` (E0.4). Threaded through the
+        detect-and-migrate prelude and (when ``type_check=True``) into
+        C3 so every unsupported-* raise records on the caller's sink
+        before propagating. ``None`` = no sink; raises still fire.
 
     Raises
     ------
@@ -197,12 +222,14 @@ def compile_pine_to_program(
     PineTypeError, PineUnsupportedBuiltinError
         C3 type-checker rejections (only when ``type_check=True``).
     """
-    migrated, version = _detect_and_migrate(source, target_version)
+    migrated, version = _detect_and_migrate(
+        source, target_version, telemetry=telemetry
+    )
     tokens = tokenize(migrated)
     program = parse(tokens, pine_version=version)
     if not type_check:
         return program
-    type_check_result = check(program, pine_version=version)
+    type_check_result = check(program, pine_version=version, telemetry=telemetry)
     return type_check_result.program
 
 
@@ -213,6 +240,7 @@ def compile_pine(
     params: dict[str, Any] | None = None,
     use_cache: bool = True,
     cache_dir: Path | None = None,
+    telemetry: "TelemetrySink | None" = None,
 ) -> CompiledModule:
     """Compile a Pine source string into a :class:`CompiledModule` (D1 §1.5).
 
@@ -258,6 +286,19 @@ def compile_pine(
         (default), uses :data:`DEFAULT_CACHE_DIR`
         (``~/.openbb/pine_cache/``). Tests + operator overrides pass a
         tmp_path here.
+    telemetry
+        Optional :class:`TelemetrySink` (E0.4) — the openbb-fork router
+        instantiates an :class:`~openbb_pine.telemetry.OpenBBTelemetrySink`
+        per request and passes it here. The sink is threaded through
+        every stage that raises ``PineUnsupported*Error``
+        (:func:`detect_pine_version`, :func:`migrate_v5_to_v6`,
+        :func:`check`, :func:`emit`) so per-request counts are captured
+        on the sink and can be surfaced in the router's response
+        envelope. ``None`` = telemetry disabled; the raises still fire
+        but no counter increments. Cache hits skip the entire pipeline
+        so no counter fires either — this matches the pre-E0.4 behavior
+        (a cached script was already validated on the compile that
+        populated the cache slot).
 
     Returns
     -------
@@ -311,16 +352,19 @@ def compile_pine(
             return hit  # cache_status already "hit"
 
     # Cache miss (or bypass) — full pipeline.
-    migrated, version = _detect_and_migrate(source, target_version)
+    migrated, version = _detect_and_migrate(
+        source, target_version, telemetry=telemetry
+    )
     tokens = tokenize(migrated)
     program = parse(tokens, pine_version=version)
-    type_check_result = check(program, pine_version=version)
+    type_check_result = check(program, pine_version=version, telemetry=telemetry)
     compiled = emit(
         type_check_result.program,
         builtins_used=type_check_result.builtins_used,
         security_contexts=type_check_result.security_contexts,
         pine_version=version,
         compiler_version=__version__,
+        telemetry=telemetry,
     )
 
     # Overwrite the emit()-produced placeholder sha + cache_status with the

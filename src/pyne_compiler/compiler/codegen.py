@@ -113,10 +113,19 @@ that we never emit and the cache-key metadata we add in the docstring.
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING
 
 from openbb_pine.compiler import ir
 from openbb_pine.compiler.types import CompiledModule, SecurityContext
 from openbb_pine.errors import PineCodegenError, PineUnsupportedFeatureError
+
+if TYPE_CHECKING:  # pragma: no cover — imports for typing only
+    # E2 will rewrite this import to ``from pyne_compiler.telemetry
+    # import TelemetrySink``. Kept behind TYPE_CHECKING so the compiler
+    # never actually imports ``openbb_pine.telemetry`` at runtime — the
+    # E0.4 injection contract (see plan Task E0.4, Step 5 and design doc
+    # §6.E0.4; the ``openbb_pine.telemetry`` module docstring recaps it).
+    from openbb_pine.telemetry import TelemetrySink
 
 __all__ = [
     "NODE_TYPE_ALLOWLIST",
@@ -403,9 +412,20 @@ class _CodegenVisitor:
     lifted into the ``def main`` signature as kwargs.
     """
 
-    def __init__(self, builtins_used: frozenset[str], pine_version: int) -> None:
+    def __init__(
+        self,
+        builtins_used: frozenset[str],
+        pine_version: int,
+        *,
+        telemetry: "TelemetrySink | None" = None,
+    ) -> None:
         self.builtins_used = builtins_used
         self.pine_version = pine_version
+        # Injected telemetry sink (E0.4). ``None`` = telemetry disabled;
+        # the PF010/PF011 guards below short-circuit and no counter fires.
+        # The :func:`emit` entry point threads this from
+        # ``compile_pine(telemetry=...)``.
+        self._telemetry = telemetry
         # (name, default_call_expr) pairs to be lifted into def main(...) kwargs.
         # Order preserved — Python kwargs are positional-by-default-value.
         self._inputs: list[tuple[str, ast.expr]] = []
@@ -417,9 +437,8 @@ class _CodegenVisitor:
     def visit_Program(self, prog: ir.Program) -> ast.Module:
         # Defer strategy() to M2 per PRD §3.2 (PF010).
         if prog.directive.kind == "strategy":
-            from openbb_pine.telemetry import record_unsupported_feature
-
-            record_unsupported_feature("PF010")
+            if self._telemetry is not None:
+                self._telemetry.record_unsupported_feature("PF010")
             raise PineUnsupportedFeatureError(
                 "PF010 strategy decl — deferred to M2 (bead 0e9.5.6)",
                 tracking_url=(
@@ -428,9 +447,8 @@ class _CodegenVisitor:
                 ),
             )
         if prog.directive.kind == "library":
-            from openbb_pine.telemetry import record_unsupported_feature
-
-            record_unsupported_feature("PF011")
+            if self._telemetry is not None:
+                self._telemetry.record_unsupported_feature("PF011")
             raise PineUnsupportedFeatureError(
                 "PF011 library decl — deferred (no Phase-1 use-case)",
                 tracking_url=(
@@ -1102,6 +1120,7 @@ def emit(
     security_contexts: dict[str, SecurityContext] | None,
     pine_version: int,
     compiler_version: str,
+    telemetry: "TelemetrySink | None" = None,
 ) -> CompiledModule:
     """Emit a :class:`CompiledModule` for ``typed_program`` (D1 §3.1).
 
@@ -1135,6 +1154,11 @@ def emit(
     compiler_version
         ``openbb_pine.__version__`` — surfaces in the @pyne docstring
         and feeds into C6's cache key.
+    telemetry
+        Optional :class:`TelemetrySink` (E0.4). Threaded into the
+        :class:`_CodegenVisitor` so PF010 (strategy) / PF011 (library)
+        raises can record on the sink before raising. ``None`` = no sink;
+        the raise still fires but no counter increments.
 
     Returns
     -------
@@ -1155,7 +1179,11 @@ def emit(
         ``strategy()`` (PF010) or ``library()`` (PF011) decl encountered;
         deferred to M2.
     """
-    visitor = _CodegenVisitor(builtins_used=builtins_used, pine_version=pine_version)
+    visitor = _CodegenVisitor(
+        builtins_used=builtins_used,
+        pine_version=pine_version,
+        telemetry=telemetry,
+    )
     module_ast = visitor.visit_Program(typed_program)
 
     # The gate — must fire BEFORE the source string is built.

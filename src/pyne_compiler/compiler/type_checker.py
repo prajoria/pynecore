@@ -59,7 +59,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from openbb_pine.compiler import ir
 from openbb_pine.compiler.builtin_signatures import (
@@ -90,6 +90,14 @@ from openbb_pine.errors import (
     PineUnsupportedBuiltinError,
     PineUnsupportedFeatureError,
 )
+
+if TYPE_CHECKING:  # pragma: no cover — imports for typing only
+    # E2 will rewrite this import to ``from pyne_compiler.telemetry
+    # import TelemetrySink``. Kept behind TYPE_CHECKING so the compiler
+    # never actually imports ``openbb_pine.telemetry`` at runtime — the
+    # E0.4 injection contract (see plan Task E0.4, Step 5 and design doc
+    # §6.E0.4; the ``openbb_pine.telemetry`` module docstring recaps it).
+    from openbb_pine.telemetry import TelemetrySink
 
 __all__ = ["TypeCheckResult", "check"]
 
@@ -242,8 +250,18 @@ class _TypeChecker:
     the rule body from a stack trace is one grep.
     """
 
-    def __init__(self, *, pine_version: int) -> None:
+    def __init__(
+        self,
+        *,
+        pine_version: int,
+        telemetry: "TelemetrySink | None" = None,
+    ) -> None:
         self.pine_version = pine_version
+        # Injected telemetry sink (E0.4). ``None`` = telemetry disabled;
+        # every ``_raise_unsupported_*`` guard short-circuits and no
+        # counter fires. The routers pass an ``OpenBBTelemetrySink``
+        # per request so per-request counts stay isolated.
+        self._telemetry = telemetry
         # Lexical scope chain: name -> PineType. The current scope is the LAST
         # element; lookups walk back to front.
         self._scopes: list[dict[str, PineType]] = [{}]
@@ -294,9 +312,10 @@ class _TypeChecker:
         self._builtins_used.add(name)
         # PRD §3.4 L0.5 wild-corpus attribution: record BEFORE raising so
         # the counter is accurate even when an outer ``except`` swallows.
-        from openbb_pine.telemetry import record_unsupported_builtin
-
-        record_unsupported_builtin(name)
+        # E0.4: telemetry is optional; when unset the counter is skipped
+        # but the raise still happens.
+        if self._telemetry is not None:
+            self._telemetry.record_unsupported_builtin(name)
         exc = PineUnsupportedBuiltinError(
             name,
             suggested_alternative=hint,
@@ -403,9 +422,8 @@ class _TypeChecker:
     def _visit_var_decl(self, stmt: ir.VarDecl) -> ir.VarDecl:
         # PF002 — typed decls in body deferred per bead spec.
         if stmt.type is not None:
-            from openbb_pine.telemetry import record_unsupported_feature
-
-            record_unsupported_feature("PF002")
+            if self._telemetry is not None:
+                self._telemetry.record_unsupported_feature("PF002")
             raise PineUnsupportedFeatureError(
                 "PF002 typed decl in body",
                 tracking_url=(
@@ -1410,7 +1428,12 @@ class _TypeChecker:
 # ---------------------------------------------------------------------------
 
 
-def check(program: ir.Program, *, pine_version: int) -> TypeCheckResult:
+def check(
+    program: ir.Program,
+    *,
+    pine_version: int,
+    telemetry: "TelemetrySink | None" = None,
+) -> TypeCheckResult:
     """Type-check ``program``, returning a :class:`TypeCheckResult`.
 
     Raises:
@@ -1422,8 +1445,13 @@ def check(program: ir.Program, *, pine_version: int) -> TypeCheckResult:
             attribute the wild-corpus shortfall.
         PineUnsupportedFeatureError: when the script uses a Pine feature
             (e.g. typed-decl-in-body PF002) not yet shipped in Phase 1.
+
+    ``telemetry`` (E0.4): optional :class:`TelemetrySink` — the C3
+    unsupported-* raise paths call ``telemetry.record_*(name)`` on it
+    BEFORE raising. ``None`` = no sink; the raise still fires but no
+    counter increments. Threaded down to :class:`_TypeChecker`.
     """
-    checker = _TypeChecker(pine_version=pine_version)
+    checker = _TypeChecker(pine_version=pine_version, telemetry=telemetry)
     new_prog = checker.check_program(program)
     return TypeCheckResult(
         program=new_prog,
