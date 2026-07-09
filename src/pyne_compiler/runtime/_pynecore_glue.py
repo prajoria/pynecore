@@ -29,6 +29,17 @@ spec; the workarounds live here with the rationale next to them.
 
 from __future__ import annotations
 
+# Belt-and-suspenders: today `openbb_pine/__init__.py` has already run the
+# bridge before any submodule import can reach us, so this second call is a
+# no-op-under-the-idempotent-guard in the openbb_pine world. Post-E2 the
+# glue moves into `pyne_compiler` and callers can import it directly
+# (without going through `openbb_pine/__init__.py`), so this line becomes
+# the actual first invocation. Keeping it now means the ordering guarantee
+# survives the migration in a single commit without a temporary window
+# where `from pynecore...` imports below race the bridge.
+from openbb_pine.runtime import pynecore_bridge  # noqa: F401 -- ensure bridge runs
+pynecore_bridge.install_pynecore_path()
+
 from contextlib import contextmanager
 from datetime import datetime, time, timezone
 from typing import TYPE_CHECKING, Any, Callable, Iterator
@@ -87,7 +98,9 @@ def make_default_syminfo(
     (``syminfo.py:46-50``): ``equity -> "stock"``, ``commodity -> "futures"``,
     ``currency -> "forex"``, ``crypto -> "crypto"``.
     """
-    # Local imports so the sys.path bridge in openbb_pine/__init__.py has run.
+    # Local import: the sys.path bridge (line 39 above and
+    # openbb_pine/__init__.py) has run, so `from pynecore...` resolves
+    # regardless of caller entry point.
     from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession  # noqa: PLC0415
 
     pyne_type_map: dict[str, str] = {
@@ -172,7 +185,9 @@ def capture_alerts(
     against the module. We therefore patch the function on the ``alert``
     module so both the namespaced and bare invocations hit the shim.
     """
-    # Local import keeps the sys.path bridge ordering intact.
+    # Local import: the sys.path bridge (line 39 above and
+    # openbb_pine/__init__.py) has run, so `from pynecore...` resolves
+    # regardless of caller entry point.
     from pynecore.lib import alert as alert_module  # noqa: PLC0415
 
     original = alert_module.alert
