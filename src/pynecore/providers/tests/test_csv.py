@@ -366,6 +366,38 @@ def __test_csv_provider_empty_file_returns_empty__(tmp_path: Path) -> None:
     assert list(provider.stream("TESTSYM", "1D")) == []
 
 
+#
+# E1.4 (bd-cko) shared behavioral conformance suite
+#
+
+def __test_csv_provider_conforms_to_shared_suite__(tmp_path: Path) -> None:
+    """Run the E1.4 shared behavioral conformance suite against a
+    fixture-loaded ``CSVProvider`` (spec §5.4).
+
+    The shared suite (``pynecore.providers.tests.test_conformance``)
+    encodes the 7 behavioral checks every ``Provider`` subclass must
+    pass. Because CSVProvider is mode-1 (spec §5.2), the missing-symbol
+    check (#5) is satisfied by the provider's own construction-time
+    guard: calling ``fetch("NEVER_EXISTS_XYZ_9999", ...)`` on a
+    provider built with ``symbol="TESTSYM"`` raises ``ValueError``.
+
+    No ``with provider:`` here — CSVProvider reads its data file
+    directly and does NOT need the base-class ``ohlcv_file`` context
+    manager (which would open a .ohlcv scratch file we never write to).
+    """
+    from pynecore.providers.tests.test_conformance import _conformance_suite
+
+    provider = _make(tmp_path)
+    _conformance_suite(
+        provider,
+        closed_only=True,
+        test_symbol="TESTSYM",
+        test_timeframe="1D",
+        range_start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        range_end=datetime(2024, 1, 5, tzinfo=timezone.utc),
+    )
+
+
 def __test_csv_provider_unsorted_rows_no_short_circuit__(tmp_path: Path) -> None:
     """Regression for PR #3 [BUG] csv.py:229 — an early stray large
     timestamp must NOT cause later in-range rows to be silently dropped.
