@@ -86,6 +86,38 @@ this file's helper is prefixed with a single leading underscore
 intent to human readers. Downstream provider test functions MUST use
 the ``__test_..._..__`` pattern to be discovered.
 
+Provider coverage status
+========================
+
+CSV (bd-gxy) and SQLite (bd-l05) reference providers invoke this suite via
+their ``__test_*_provider_conforms_to_shared_suite__`` functions. The
+pre-existing CCXTProvider and CapitalComProvider do NOT yet invoke it —
+those are network-oriented mode-1 providers that need recorded fixtures
+before the suite can run cleanly. Retroactive audit is tracked as bd-7a8
+(OpenBBTechnical-7a8, "Retroactively verify CCXTProvider +
+CapitalComProvider pass conformance suite"), blocked by bd-cko landing.
+
+Deliberate spec deviations (stricter than spec §5.4)
+====================================================
+
+Two checks below intentionally test more than the spec §5.4 wording:
+
+* **Check #6** also asserts that naive ``datetime`` inputs raise
+  ``TypeError`` on BOTH ``start`` and ``end``. Spec §5.4 check #6 only
+  names the returned-bar UTC round-trip. The input-side prong is
+  defensible: a provider that returns UTC bars but silently accepts naive
+  input bounds is internally inconsistent, and the strictness closes a
+  class of "future subclass overrides ``stream()`` and forgets to
+  re-invoke ``super()``'s naive-datetime guard" bugs at the API surface.
+* **Check #7** also asserts ``stream()`` statelessness. Spec §5.4 check
+  #7 only names ``fetch()``. The same "no cursor state between calls"
+  invariant per spec §5.2 applies to ``stream()``, and the extension
+  catches bugs where ``fetch()`` is a thin wrapper over ``stream()`` that
+  materializes fresh each call while ``stream()`` itself leaks state.
+
+Both extensions are hardening — a future spec revision may fold them in;
+until then this docstring is the authoritative record of the delta.
+
 Clean-room: I have not viewed TradingView or PyneComp source code.
 """
 from __future__ import annotations
