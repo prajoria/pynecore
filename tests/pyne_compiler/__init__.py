@@ -1,3 +1,0 @@
-"""
-Pyne Compiler Placeholder Tests
-"""
