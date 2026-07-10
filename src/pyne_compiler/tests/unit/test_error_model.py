@@ -588,71 +588,46 @@ class TestErrorCodeEnforcement:
 
 
 # ---------------------------------------------------------------------------
-# Telemetry counters (D1 §3.5 + PRD §9.4)
+# Integration: unsupported-builtin raise sites increment the injected sink.
+#
+# E0.6 gray-zone refactor: the module-global counter tests
+# (``TestTelemetryCounters``) that used to live here import
+# ``openbb_pine.telemetry`` directly and moved to
+# ``test_telemetry_module_globals.py`` (STAY). The integration tests
+# below now use an in-test ``_CountingSink`` implementing the
+# ``TelemetrySink`` Protocol shape, so this file's non-stdlib imports
+# are pynecore-side only (compiler + errors + IR) and it can MOVE to
+# ``pyne_compiler`` at E2.
 # ---------------------------------------------------------------------------
 
 
-class TestTelemetryCounters:
-    def setup_method(self) -> None:
-        """Isolate every test case from residual counter state."""
-        from openbb_pine.telemetry import reset_metrics
+class _CountingSink:
+    """In-test :class:`TelemetrySink` Protocol implementation.
 
-        reset_metrics()
+    Deliberately **structural-typing** against the future
+    ``pyne_compiler.telemetry.TelemetrySink`` Protocol (see E0.6 test-split
+    manifest at ``docs/superpowers/plans/e06-test-split-manifest.md``):
+    once this file MOVES to ``pyne_compiler`` at E2 it must not import
+    the concrete fork-side ``openbb_pine.telemetry.OpenBBTelemetrySink``.
+    Mirrors the two ``record_*`` methods the compiler pipeline calls
+    plus ``get_*`` snapshot helpers used by these assertions.
+    """
 
-    def test_record_unsupported_builtin_increments(self) -> None:
-        from openbb_pine.telemetry import (
-            get_unsupported_builtin_counts,
-            record_unsupported_builtin,
-        )
+    def __init__(self) -> None:
+        self._builtins: dict[str, int] = {}
+        self._features: dict[str, int] = {}
 
-        record_unsupported_builtin("ta.ichimoku")
-        record_unsupported_builtin("ta.ichimoku")
-        record_unsupported_builtin("ta.tsi")
-        counts = get_unsupported_builtin_counts()
-        assert counts["ta.ichimoku"] == 2
-        assert counts["ta.tsi"] == 1
+    def record_unsupported_builtin(self, name: str) -> None:
+        self._builtins[name] = self._builtins.get(name, 0) + 1
 
-    def test_record_unsupported_feature_increments(self) -> None:
-        from openbb_pine.telemetry import (
-            get_unsupported_feature_counts,
-            record_unsupported_feature,
-        )
+    def record_unsupported_feature(self, name: str) -> None:
+        self._features[name] = self._features.get(name, 0) + 1
 
-        record_unsupported_feature("PF010")
-        counts = get_unsupported_feature_counts()
-        assert counts["PF010"] == 1
+    def get_unsupported_builtin_counts(self) -> dict[str, int]:
+        return dict(self._builtins)
 
-    def test_reset_metrics_clears_both(self) -> None:
-        from openbb_pine.telemetry import (
-            get_unsupported_builtin_counts,
-            get_unsupported_feature_counts,
-            record_unsupported_builtin,
-            record_unsupported_feature,
-            reset_metrics,
-        )
-
-        record_unsupported_builtin("ta.foo")
-        record_unsupported_feature("PF999")
-        reset_metrics()
-        assert get_unsupported_builtin_counts() == {}
-        assert get_unsupported_feature_counts() == {}
-
-    def test_get_returns_copy_not_live_reference(self) -> None:
-        """Mutating the returned dict must NOT bleed into the counter state."""
-        from openbb_pine.telemetry import (
-            get_unsupported_builtin_counts,
-            record_unsupported_builtin,
-        )
-
-        record_unsupported_builtin("ta.x")
-        snapshot = get_unsupported_builtin_counts()
-        snapshot["ta.injected"] = 999
-        assert "ta.injected" not in get_unsupported_builtin_counts()
-
-
-# ---------------------------------------------------------------------------
-# Integration: unsupported-builtin raise sites increment the counter.
-# ---------------------------------------------------------------------------
+    def get_unsupported_feature_counts(self) -> dict[str, int]:
+        return dict(self._features)
 
 
 class TestTelemetryIntegration:
@@ -663,11 +638,6 @@ class TestTelemetryIntegration:
     ``test_telemetry_injection.py``.
     """
 
-    def setup_method(self) -> None:
-        from openbb_pine.telemetry import reset_metrics
-
-        reset_metrics()
-
     def test_type_checker_raise_records_builtin(self) -> None:
         """The C3 type checker's ``_raise_unsupported_builtin`` MUST call
         ``sink.record_unsupported_builtin(name)`` on the injected sink
@@ -676,9 +646,8 @@ class TestTelemetryIntegration:
         instead of the pre-E0.4 module-global recorder)."""
         from openbb_pine.compiler.type_checker import _TypeChecker
         from openbb_pine.errors import PineUnsupportedBuiltinError
-        from openbb_pine.telemetry import OpenBBTelemetrySink
 
-        sink = OpenBBTelemetrySink()
+        sink = _CountingSink()
         tc = _TypeChecker(pine_version=6, telemetry=sink)
         with pytest.raises(PineUnsupportedBuiltinError):
             tc._raise_unsupported_builtin(
@@ -695,9 +664,8 @@ class TestTelemetryIntegration:
         from openbb_pine.compiler import ir
         from openbb_pine.compiler.codegen import _CodegenVisitor
         from openbb_pine.errors import PineUnsupportedFeatureError
-        from openbb_pine.telemetry import OpenBBTelemetrySink
 
-        sink = OpenBBTelemetrySink()
+        sink = _CountingSink()
         span = _make_dummy_span()
         directive = ir.ScriptDirective(
             loc=span,
