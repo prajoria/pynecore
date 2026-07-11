@@ -418,17 +418,12 @@ class _TypeChecker:
         return stmt
 
     def _visit_var_decl(self, stmt: ir.VarDecl) -> ir.VarDecl:
-        # PF002 — typed decls in body deferred per bead spec.
-        if stmt.type is not None:
-            if self._telemetry is not None:
-                self._telemetry.record_unsupported_feature("PF002")
-            raise PineUnsupportedFeatureError(
-                "PF002 typed decl in body",
-                tracking_url=(
-                    "https://github.com/OpenBB-finance/OpenBBTerminal/issues/"
-                    "?labels=pine-feature&q=typed-decl"
-                ),
-            )
+        # bd-27v7: typed decls in body are now supported. Semantics:
+        #   * declared type overrides inference for the binding registration
+        #   * `na` initializer unifies with the declared inner type
+        #   * PT002 (var/varip RHS ⊑ simple) still applies to the value's
+        #     inferred qualifier, ignoring the declared one (the declaration
+        #     names a resting qualifier, not an initializer constraint).
         new_val, val_type = self._visit_expr(stmt.value)
         # PT002 — `var x = e` requires e: simple<T> (or weaker).
         if stmt.qualifier in ("var", "varip"):
@@ -443,8 +438,12 @@ class _TypeChecker:
                         "must be simple<T> (or const<T>), not series<T>."
                     ),
                 )
+        # When a declared type is present, it wins for the registered binding
+        # (Pine's `T name = e` form). `na` initializers rely on this because
+        # NaT has no intrinsic scalar kind to infer from.
+        bound_type = stmt.type if stmt.type is not None else val_type
         # Register the binding.
-        self._declare(stmt.name, val_type)
+        self._declare(stmt.name, bound_type)
         return dataclasses.replace(stmt, value=new_val)
 
     def _visit_assign(self, stmt: ir.Assign) -> ir.Assign:
