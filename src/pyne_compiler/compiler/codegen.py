@@ -434,17 +434,9 @@ class _CodegenVisitor:
     # ------------------------------------------------------------------
 
     def visit_Program(self, prog: ir.Program) -> ast.Module:
-        # Defer strategy() to M2 per PRD §3.2 (PF010).
-        if prog.directive.kind == "strategy":
-            if self._telemetry is not None:
-                self._telemetry.record_unsupported_feature("PF010")
-            raise PineUnsupportedFeatureError(
-                "PF010 strategy decl — deferred to M2 (bead 0e9.5.6)",
-                tracking_url=(
-                    "https://github.com/OpenBB-finance/OpenBBTerminal/issues/"
-                    "?labels=pine-feature&q=PF010+strategy"
-                ),
-            )
+        # bd-aeh (D5 §7.3 C5): strategy() now emits @script.strategy(...),
+        # mirroring the existing @script.indicator branch. library() remains
+        # deferred (PF011).
         if prog.directive.kind == "library":
             if self._telemetry is not None:
                 self._telemetry.record_unsupported_feature("PF011")
@@ -1213,6 +1205,7 @@ def emit(
         builtins_used=builtins_used,
         security_contexts=security_contexts,
         cache_status="bypass",
+        script_type=typed_program.directive.kind,  # bd-aeh (D5 §5.1)
     )
 
 
