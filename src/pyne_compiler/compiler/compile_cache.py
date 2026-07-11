@@ -260,6 +260,9 @@ def cache_read(sha: str, *, cache_dir: Path = DEFAULT_CACHE_DIR) -> CompiledModu
         builtins_used=frozenset(meta["builtins_used"]),
         security_contexts=sec,
         cache_status="hit",
+        # bd-aeh: roundtrip script_type; older meta.json lacks it → default
+        # to "indicator" for backwards compatibility.
+        script_type=str(meta.get("script_type", "indicator")),  # type: ignore[arg-type]
     )
 
 
@@ -369,6 +372,7 @@ def cache_write(compiled: CompiledModule, *, cache_dir: Path = DEFAULT_CACHE_DIR
         ),
         "cached_at": time.time(),
         "source_len": len(compiled.source),
+        "script_type": compiled.script_type,  # bd-aeh (D5 §5.1)
     }
     meta_json = json.dumps(meta, sort_keys=True, separators=(",", ":"))
 
