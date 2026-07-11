@@ -49,7 +49,141 @@ __all__ = [
     "OpenPositionSummary",
     "trade_to_summary",
     "position_to_summary",
+    "serialize_strategy_statistics",
+    "capture_equity_snapshot",
 ]
+
+
+# ---------------------------------------------------------------------------
+# StrategyStatistics serializer (bd-5k0) — dict-form for OBBject.extra["stats"]
+# ---------------------------------------------------------------------------
+#
+# Sourced from ``pynecore.core.strategy_stats.StrategyStatistics`` (see
+# ``src/pynecore/core/strategy_stats.py:17``). That dataclass carries ~70
+# fields; we surface the Pine-canonical core set on the wire with stable
+# key names so the OBBject.extra["stats"] shape is agnostic to whether
+# PyneCore renames its internal attributes over time.
+#
+# Key aliasing: PyneCore uses ``total_trades`` (matches TV's "Total
+# Trades" row) and ``max_equity_drawdown`` (matches TV's "Max Drawdown");
+# on the wire we normalize to ``closed_trades`` and ``max_drawdown`` for
+# symmetry with the ``TradeSummary`` / ``.extra["orders"]`` naming used
+# elsewhere in this module. Callers passing a duck-typed shape may use
+# either alias — the serializer prefers the canonical PyneCore name and
+# falls back to the wire name.
+#
+# The canonical field list (see ``_STATS_FIELDS`` below) is a curated
+# subset. The full StrategyStatistics dataclass includes long/short
+# breakouts, per-side avg-bar counts, etc.; those are omitted on the
+# public wire until a caller asks for them. Add fields here — do not
+# blanket-``asdict()`` the source, because that leaks PyneCore-internal
+# helper attributes (e.g. ``margin_calls``) that TV's Strategy Tester
+# does not expose in its stats panel.
+
+# (wire_key, pynecore_attr, wire_key_fallback)
+# The ``wire_key_fallback`` field is set when the wire key differs from
+# the pynecore attribute and duck-typed callers may pass the wire name
+# directly (test doubles, mock stats). The serializer probes both.
+_STATS_FIELDS: tuple[tuple[str, str, str | None], ...] = (
+    ("net_profit", "net_profit", None),
+    ("net_profit_percent", "net_profit_percent", None),
+    ("gross_profit", "gross_profit", None),
+    ("gross_profit_percent", "gross_profit_percent", None),
+    ("gross_loss", "gross_loss", None),
+    ("gross_loss_percent", "gross_loss_percent", None),
+    ("max_drawdown", "max_equity_drawdown", "max_drawdown"),
+    ("max_drawdown_percent", "max_equity_drawdown_percent", "max_drawdown_percent"),
+    ("max_runup", "max_equity_runup", "max_runup"),
+    ("max_runup_percent", "max_equity_runup_percent", "max_runup_percent"),
+    ("buy_and_hold_return", "buy_and_hold_return", None),
+    ("buy_and_hold_return_percent", "buy_and_hold_return_percent", None),
+    ("sharpe_ratio", "sharpe_ratio", None),
+    ("sortino_ratio", "sortino_ratio", None),
+    ("profit_factor", "profit_factor", None),
+    ("closed_trades", "total_trades", "closed_trades"),
+    ("winning_trades", "winning_trades", None),
+    ("losing_trades", "losing_trades", None),
+    ("percent_profitable", "percent_profitable", None),
+    ("avg_trade", "avg_trade", None),
+    ("avg_winning_trade", "avg_winning_trade", None),
+    ("avg_losing_trade", "avg_losing_trade", None),
+    ("largest_winning_trade", "largest_winning_trade", None),
+    ("largest_losing_trade", "largest_losing_trade", None),
+    ("avg_bars_in_trades", "avg_bars_in_trades", None),
+    ("commission_paid", "commission_paid", None),
+    ("max_contracts_held", "max_contracts_held", None),
+    ("open_trades", "total_open_trades", "open_trades"),
+    ("max_cons_winning_trades", "max_cons_winning_trades", None),
+    ("max_cons_losing_trades", "max_cons_losing_trades", None),
+    ("ratio_avg_win_loss", "ratio_avg_win_loss", None),
+)
+
+
+def serialize_strategy_statistics(stats: object | None) -> dict | None:
+    """Convert a ``StrategyStatistics``-shaped object to a plain dict for
+    ``OBBject.extra["stats"]``.
+
+    Returns ``None`` when ``stats`` is ``None`` (an indicator run has no
+    strategy statistics to serialize — the executor should omit the
+    ``stats`` key entirely, or set it to ``None`` explicitly).
+
+    Duck-typed: reads only attributes listed in ``_STATS_FIELDS``.
+    Handles the PyneCore canonical names (e.g. ``total_trades``,
+    ``max_equity_drawdown``) and their wire-name equivalents
+    (``closed_trades``, ``max_drawdown``) so hand-rolled test mocks
+    using the wire vocabulary work identically to real
+    ``StrategyStatistics`` instances.
+
+    Missing attributes are silently skipped (rather than defaulted to
+    zero) so a caller passing a partial mock does not accumulate
+    zero-valued keys that the caller never actually set. Real
+    ``StrategyStatistics`` always has every field (dataclass defaults),
+    so partial output only occurs for test doubles.
+
+    :param stats: A ``pynecore.core.strategy_stats.StrategyStatistics``
+        or any duck-typed object exposing the same field names.
+    :returns: A dict of the canonical Pine stats keys, or ``None`` when
+        the input was ``None``.
+    """
+    if stats is None:
+        return None
+    out: dict = {}
+    for wire_key, pyne_attr, wire_fallback in _STATS_FIELDS:
+        if hasattr(stats, pyne_attr):
+            out[wire_key] = getattr(stats, pyne_attr)
+        elif wire_fallback is not None and hasattr(stats, wire_fallback):
+            out[wire_key] = getattr(stats, wire_fallback)
+    return out
+
+
+def capture_equity_snapshot(
+    curve: list,
+    bar_index: int,
+    equity: float,
+    drawdown: float,
+) -> None:
+    """Append one equity-curve snapshot to ``curve`` in place.
+
+    Snapshot shape is a plain dict: ``{"bar_index": int, "equity":
+    float, "drawdown": float}``. The executor calls this once per
+    strategy bar (after ``ScriptRunner`` advances) to build the
+    ``OBBject.extra["equity_curve"]`` list.
+
+    The caller owns the ``curve`` list — this function just adds
+    structure so every snapshot on the wire has the same key names.
+    Passing a fresh ``[]`` at the start of the run and reading it at
+    end-of-run yields the per-bar equity trajectory.
+
+    :param curve: Target list (mutated in place — append semantics).
+    :param bar_index: Bar index of the snapshot (0-based).
+    :param equity: Running equity value in currency (typically
+        ``strategy.equity`` from PyneCore, which includes closed P&L +
+        unrealized).
+    :param drawdown: Running drawdown magnitude in currency (non-negative;
+        ``0.0`` when equity is at a new high). Matches PyneCore's
+        ``max_equity_drawdown`` semantics on a per-bar basis.
+    """
+    curve.append({"bar_index": bar_index, "equity": equity, "drawdown": drawdown})
 
 
 # ---------------------------------------------------------------------------
