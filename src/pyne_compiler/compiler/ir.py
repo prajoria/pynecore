@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from openbb_pine.compiler.types import PineType
+from pyne_compiler.compiler.types import PineType
 
 __all__ = [
     "Span",

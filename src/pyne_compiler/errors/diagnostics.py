@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from openbb_pine.attribution import POWERED_BY_FULL, POWERED_BY_SHORT
+from pyne_compiler.attribution import POWERED_BY_FULL, POWERED_BY_SHORT
 
 # --------------------------------------------------------------------------
 # Module-level configuration seams (patched in tests; real defaults in prod)

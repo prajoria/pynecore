@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from openbb_pine.compiler.types import AnyT, NaT, PineType, Scalar, TupleT
+from pyne_compiler.compiler.types import AnyT, NaT, PineType, Scalar, TupleT
 
 __all__ = [
     "Signature",

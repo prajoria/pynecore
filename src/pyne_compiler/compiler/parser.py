@@ -44,9 +44,9 @@ from lark import Lark, Token as LarkToken, Transformer, Tree
 from lark.exceptions import LarkError, UnexpectedInput, UnexpectedToken
 from lark.lexer import Lexer as LarkLexer
 
-from openbb_pine.compiler import ir
-from openbb_pine.compiler.lexer import Token as PineToken
-from openbb_pine.compiler.types import (
+from pyne_compiler.compiler import ir
+from pyne_compiler.compiler.lexer import Token as PineToken
+from pyne_compiler.compiler.types import (
     PineType,
     Scalar,
     UDT,
@@ -54,7 +54,7 @@ from openbb_pine.compiler.types import (
     MapT,
     MatrixT,
 )
-from openbb_pine.compiler_errors import PineSyntaxError
+from pyne_compiler.errors.base import PineSyntaxError
 
 __all__ = ["parse"]
 
@@ -225,7 +225,7 @@ def _match_hint(err: UnexpectedToken, pine_version: int) -> str | None:
     repeatedly with snippets and that raises on errors — so we lex each
     example and feed it through the cached parser.
     """
-    from openbb_pine.compiler.lexer import tokenize as _pine_tokenize
+    from pyne_compiler.compiler.lexer import tokenize as _pine_tokenize
 
     parser = _lark_for_version(pine_version)
 

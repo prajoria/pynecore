@@ -115,17 +115,16 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 
-from openbb_pine.compiler import ir
-from openbb_pine.compiler.types import CompiledModule, SecurityContext
-from openbb_pine.errors import PineCodegenError, PineUnsupportedFeatureError
+from pyne_compiler.compiler import ir
+from pyne_compiler.compiler.types import CompiledModule, SecurityContext
+from pyne_compiler.errors.base import PineCodegenError, PineUnsupportedFeatureError
 
 if TYPE_CHECKING:  # pragma: no cover — imports for typing only
-    # E2 will rewrite this import to ``from pyne_compiler.telemetry
-    # import TelemetrySink``. Kept behind TYPE_CHECKING so the compiler
-    # never actually imports ``openbb_pine.telemetry`` at runtime — the
-    # E0.4 injection contract (see plan Task E0.4, Step 5 and design doc
-    # §6.E0.4; the ``openbb_pine.telemetry`` module docstring recaps it).
-    from openbb_pine.telemetry import TelemetrySink
+    # Post-9bh: telemetry now lives at pyne_compiler.telemetry (extraction
+    # complete). Kept behind TYPE_CHECKING so the compiler never actually
+    # imports telemetry at runtime — the E0.4 injection contract (see
+    # plan Task E0.4, Step 5 and design doc §6.E0.4).
+    from pyne_compiler.telemetry import TelemetrySink
 
 __all__ = [
     "NODE_TYPE_ALLOWLIST",
@@ -1225,7 +1224,7 @@ assert GLOBAL_NAME_ALLOWLIST, "GLOBAL_NAME_ALLOWLIST must be non-empty"
 # Mirror-check against runtime/restricted: every name in _ALLOWED_BUILTINS
 # must be in GLOBAL_NAME_ALLOWLIST (the gate and the exec namespace must
 # agree on the Python-builtin surface area).
-from openbb_pine.runtime.restricted import _ALLOWED_BUILTINS  # noqa: E402
+from pyne_compiler.runtime.restricted import _ALLOWED_BUILTINS  # noqa: E402
 
 _runtime_only = _ALLOWED_BUILTINS - GLOBAL_NAME_ALLOWLIST
 assert not _runtime_only, (

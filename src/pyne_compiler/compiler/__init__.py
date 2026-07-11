@@ -66,20 +66,20 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from openbb_pine import __version__
-from openbb_pine.compiler import ir
-from openbb_pine.compiler.codegen import emit
-from openbb_pine.compiler.compile_cache import (
+from pyne_compiler import __version__
+from pyne_compiler.compiler import ir
+from pyne_compiler.compiler.codegen import emit
+from pyne_compiler.compiler.compile_cache import (
     DEFAULT_CACHE_DIR,
     cache_read,
     cache_write,
     make_cache_key,
 )
-from openbb_pine.compiler.lexer import Token, tokenize
-from openbb_pine.compiler.parser import parse
-from openbb_pine.compiler.type_checker import check
-from openbb_pine.compiler.types import CompiledModule
-from openbb_pine.compiler.v5_migration import (
+from pyne_compiler.compiler.lexer import Token, tokenize
+from pyne_compiler.compiler.parser import parse
+from pyne_compiler.compiler.type_checker import check
+from pyne_compiler.compiler.types import CompiledModule
+from pyne_compiler.compiler.v5_migration import (
     V5Rewrite,
     V5_REWRITES,
     detect_pine_version,
@@ -87,12 +87,12 @@ from openbb_pine.compiler.v5_migration import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover — imports for typing only
-    # E2 will rewrite this import to ``from pyne_compiler.telemetry
-    # import TelemetrySink``. Kept behind TYPE_CHECKING so the compiler
-    # never actually imports ``openbb_pine.telemetry`` at runtime — the
-    # E0.4 injection contract (see plan Task E0.4, Step 5 and design doc
-    # §6.E0.4; the ``openbb_pine.telemetry`` module docstring recaps it).
-    from openbb_pine.telemetry import TelemetrySink
+    # Post-9bh: import target is pyne_compiler.telemetry (extraction
+    # complete). Kept behind TYPE_CHECKING so the compiler never actually
+    # imports telemetry at runtime — the E0.4 injection contract (see
+    # plan Task E0.4, Step 5 and design doc §6.E0.4; the telemetry
+    # module docstring recaps it).
+    from pyne_compiler.telemetry import TelemetrySink
 
 __all__ = [
     "Token",
@@ -126,7 +126,7 @@ def _detect_and_migrate(
     PF002 / PF003 raise paths record on the caller's sink.
     """
     if target_version not in (5, 6):
-        from openbb_pine.errors import PineUnsupportedFeatureError
+        from pyne_compiler.errors.base import PineUnsupportedFeatureError
 
         if telemetry is not None:
             telemetry.record_unsupported_feature("PF002")
@@ -156,7 +156,7 @@ def _detect_and_migrate(
         # Defensive: detect_pine_version already raises on PF001/PF002;
         # if we reach here it's the supported-pair-mismatch case
         # (e.g. detected=6 but target=5, which we don't support).
-        from openbb_pine.errors import PineUnsupportedFeatureError
+        from pyne_compiler.errors.base import PineUnsupportedFeatureError
 
         if telemetry is not None:
             telemetry.record_unsupported_feature("PF002")

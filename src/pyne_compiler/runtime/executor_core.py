@@ -43,20 +43,20 @@ from typing import TYPE_CHECKING, Any, Iterable
 
 import pandas as pd
 
-from openbb_pine.compiler_errors import (
+from pyne_compiler.errors.base import (
     PineExecTimeoutError,
     PineSecurityError,
 )
-from openbb_pine.runtime._pynecore_glue import (
+from pyne_compiler.runtime._pynecore_glue import (
     capture_alerts,
     ensure_pyne_header,
     make_default_syminfo,
     scan_for_forbidden_imports,
 )
-from openbb_pine.runtime.limits import DEFAULT_TIMEOUT_S, enforce_limits
+from pyne_compiler.runtime.limits import DEFAULT_TIMEOUT_S, enforce_limits
 
 if TYPE_CHECKING:  # pragma: no cover -- typing-only
-    from openbb_pine.compiler.types import CompiledModule
+    from pyne_compiler.compiler.types import CompiledModule
     from pynecore.types.ohlcv import OHLCV
 
 
