@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from openbb_pine.compiler_errors import PineTypeError
+from pyne_compiler.errors.base import PineTypeError
 
 __all__ = [
     "Qualifier",

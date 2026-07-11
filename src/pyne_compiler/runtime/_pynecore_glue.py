@@ -37,7 +37,7 @@ from __future__ import annotations
 # the actual first invocation. Keeping it now means the ordering guarantee
 # survives the migration in a single commit without a temporary window
 # where `from pynecore...` imports below race the bridge.
-from openbb_pine.runtime import pynecore_bridge  # noqa: F401 -- ensure bridge runs
+from pyne_compiler.runtime import pynecore_bridge  # noqa: F401 -- ensure bridge runs
 pynecore_bridge.install_pynecore_path()
 
 from contextlib import contextmanager

@@ -55,8 +55,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from openbb_pine.compiler.types import CompiledModule, SecurityContext
-from openbb_pine.compiler_errors import PineCacheError
+from pyne_compiler.compiler.types import CompiledModule, SecurityContext
+from pyne_compiler.errors.base import PineCacheError
 
 __all__ = [
     "DEFAULT_CACHE_DIR",

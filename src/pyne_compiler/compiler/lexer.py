@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from openbb_pine.compiler_errors import PineSyntaxError
+from pyne_compiler.errors.base import PineSyntaxError
 
 __all__ = ["Token", "tokenize"]
 

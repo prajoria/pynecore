@@ -38,7 +38,7 @@ from dataclasses import dataclass
 # speculative cycle that never materialized. If a future refactor makes
 # `compiler_errors` import from `error_codes`, revert this to a lazy
 # import inside the function to break the cycle.
-from openbb_pine.compiler_errors import PineInternalCompilerError
+from pyne_compiler.errors.base import PineInternalCompilerError
 
 
 @dataclass(frozen=True, slots=True)

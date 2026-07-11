@@ -88,13 +88,13 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 import pandas as pd
 
-from openbb_pine.compiler_errors import (
+from pyne_compiler.errors.base import (
     PineSecurityContextNotFoundError,
     PineUnsupportedBuiltinError,
 )
 
 if TYPE_CHECKING:  # pragma: no cover -- typing-only
-    from openbb_pine.compiler.types import SecurityContext
+    from pyne_compiler.compiler.types import SecurityContext
 
 
 __all__ = [

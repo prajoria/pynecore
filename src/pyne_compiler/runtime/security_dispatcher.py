@@ -55,12 +55,12 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import pandas as pd
 
-from openbb_pine.compiler_errors import PineDataResolverError
-from openbb_pine.runtime.secondary_cache import SecondarySeriesCache
+from pyne_compiler.errors.base import PineDataResolverError
+from pyne_compiler.runtime.secondary_cache import SecondarySeriesCache
 
 if TYPE_CHECKING:  # pragma: no cover -- typing-only
-    from openbb_pine.compiler.types import SecurityContext
-    from openbb_pine.runtime._data_provider_stub import _DataProviderStub
+    from pyne_compiler.compiler.types import SecurityContext
+    from pynecore.providers.provider import Provider as _DataProviderStub
 
 
 __all__ = [

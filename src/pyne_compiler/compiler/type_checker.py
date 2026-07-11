@@ -61,14 +61,14 @@ import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from openbb_pine.compiler import ir
-from openbb_pine.compiler.builtin_signatures import (
+from pyne_compiler.compiler import ir
+from pyne_compiler.compiler.builtin_signatures import (
     BUILTIN_SIGNATURES,
     Signature,
     is_builtin_namespace,
     lookup as lookup_builtin,
 )
-from openbb_pine.compiler.types import (
+from pyne_compiler.compiler.types import (
     AnyT,
     ArrayT,
     InnerType,
@@ -85,19 +85,17 @@ from openbb_pine.compiler.types import (
     UnknownT,
     can_promote,
 )
-from openbb_pine.errors import (
+from pyne_compiler.errors.base import (
     PineTypeError,
     PineUnsupportedBuiltinError,
     PineUnsupportedFeatureError,
 )
 
 if TYPE_CHECKING:  # pragma: no cover — imports for typing only
-    # E2 will rewrite this import to ``from pyne_compiler.telemetry
-    # import TelemetrySink``. Kept behind TYPE_CHECKING so the compiler
-    # never actually imports ``openbb_pine.telemetry`` at runtime — the
-    # E0.4 injection contract (see plan Task E0.4, Step 5 and design doc
-    # §6.E0.4; the ``openbb_pine.telemetry`` module docstring recaps it).
-    from openbb_pine.telemetry import TelemetrySink
+    # Post-9bh: telemetry now lives at pyne_compiler.telemetry (extraction
+    # complete). Kept behind TYPE_CHECKING so the compiler never actually
+    # imports telemetry at runtime — the E0.4 injection contract.
+    from pyne_compiler.telemetry import TelemetrySink
 
 __all__ = ["TypeCheckResult", "check"]
 
@@ -1092,7 +1090,7 @@ class _TypeChecker:
         # scripts pass (e.g. ``calc_bars_count``) are still walked but
         # unenforced — matches the ``_check_call_args`` stub tolerance.
         new_kw_args: list[ir.KeywordArg] = []
-        from openbb_pine.compiler.builtin_signatures import BUILTIN_SIGNATURES
+        from pyne_compiler.compiler.builtin_signatures import BUILTIN_SIGNATURES
 
         sig = BUILTIN_SIGNATURES["request.security"]
         for name, arg in by_name.items():
