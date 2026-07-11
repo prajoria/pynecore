@@ -417,9 +417,17 @@ class _CodegenVisitor:
         pine_version: int,
         *,
         telemetry: "TelemetrySink | None" = None,
+        security_contexts: dict[str, SecurityContext] | None = None,
     ) -> None:
         self.builtins_used = builtins_used
         self.pine_version = pine_version
+        # C3-populated ``request.security`` map (bd-god / D5 §7.3). When
+        # non-empty we emit a module-level ``__security_contexts__`` dict
+        # so downstream consumers (the c1x prefetch dispatcher; PyneCore's
+        # own ScriptRunner scan) can introspect what the script needs.
+        # ``None`` / empty → no constant emitted, keeping the output slim
+        # for scripts that don't call ``request.security`` at all.
+        self._security_contexts = security_contexts
         # Injected telemetry sink (E0.4). ``None`` = telemetry disabled;
         # the PF010/PF011 guards below short-circuit and no counter fires.
         # The :func:`emit` entry point threads this from
@@ -494,6 +502,16 @@ class _CodegenVisitor:
             module_body.append(import_stmt)
         module_body.append(main_fn)
 
+        # Emit ``__security_contexts__ = {...}`` module-level constant so
+        # downstream consumers (the c1x prefetch dispatcher; PyneCore's
+        # ScriptRunner scan at script_runner.py L405) can introspect the
+        # ``request.security`` contexts the script needs. bd-god / D5 §7.3.
+        # Skipped when the script has no request.security calls — keeps
+        # the output slim for the common Phase-1 case.
+        contexts_assign = self._build_security_contexts_constant()
+        if contexts_assign is not None:
+            module_body.append(contexts_assign)
+
         module = ast.Module(body=module_body, type_ignores=[])
         ast.fix_missing_locations(module)
         return module
@@ -540,6 +558,52 @@ class _CodegenVisitor:
             module="pynecore.lib",
             names=[ast.alias(name=n, asname=None) for n in sorted_names],
             level=0,
+        )
+
+    def _build_security_contexts_constant(self) -> ast.Assign | None:
+        """Emit ``__security_contexts__ = {"ctx_0": {...}, ...}`` (D5 §7.3).
+
+        One entry per :class:`SecurityContext` C3 populated. Each value is
+        a plain ``dict`` literal — evaluable at module scope with zero
+        runtime dependencies so the constant survives `ast.unparse` +
+        Python re-compile without pulling ``SecurityContext`` into the
+        emitted module's import graph. The runtime hook
+        (:mod:`openbb_pine.runtime.security_hook`) reads
+        ``CompiledModule.security_contexts`` directly for the typed shape;
+        the module constant is the wire format for PyneCore's
+        ``ScriptRunner`` and any operator introspecting the compiled
+        module without going through :class:`CompiledModule`.
+
+        Returns None when there are no contexts — keeps the emitted
+        source slim for scripts that don't call ``request.security``.
+        """
+        if not self._security_contexts:
+            return None
+        keys: list[ast.expr] = []
+        values: list[ast.expr] = []
+        for cid, ctx in self._security_contexts.items():
+            keys.append(ast.Constant(value=cid))
+            values.append(
+                ast.Dict(
+                    keys=[
+                        ast.Constant(value="symbol"),
+                        ast.Constant(value="timeframe"),
+                        ast.Constant(value="expr"),
+                        ast.Constant(value="dynamic_symbol"),
+                        ast.Constant(value="dynamic_timeframe"),
+                    ],
+                    values=[
+                        ast.Constant(value=ctx.symbol),
+                        ast.Constant(value=ctx.timeframe),
+                        ast.Constant(value=ctx.expr),
+                        ast.Constant(value=ctx.dynamic_symbol),
+                        ast.Constant(value=ctx.dynamic_timeframe),
+                    ],
+                )
+            )
+        return ast.Assign(
+            targets=[ast.Name(id="__security_contexts__", ctx=ast.Store())],
+            value=ast.Dict(keys=keys, values=values),
         )
 
     def _build_script_decorator(self, directive: ir.ScriptDirective) -> ast.Call:
@@ -1182,6 +1246,7 @@ def emit(
         builtins_used=builtins_used,
         pine_version=pine_version,
         telemetry=telemetry,
+        security_contexts=security_contexts,
     )
     module_ast = visitor.visit_Program(typed_program)
 
