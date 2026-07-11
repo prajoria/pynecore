@@ -698,6 +698,13 @@ BUILTIN_SIGNATURES: dict[str, Signature] = {
     #     decorator) but the attribute still needs to resolve cleanly; else
     #     the type checker raises PineUnsupportedBuiltinError before ever
     #     reaching the directive walk.
+    # Position-introspection reads (bd-9cae). Pynecore exposes each as a
+    # module-level ``@module_property`` in ``pynecore.lib.strategy`` (see
+    # ``position_size`` / ``position_avg_price`` in that module), so codegen
+    # emits ``strategy.position_size`` verbatim through the existing
+    # attribute-chain path — no codegen change required. Marked series<float>
+    # because the value updates every bar as fills mutate the sim position.
+    "strategy.position_size":     Signature(args=(), returns=_SERIES_FLOAT, notes="IMPLEMENTED"),
     "strategy.long":              Signature(args=(), returns=_CONST_STRING, notes="SIGNATURE_ONLY"),
     "strategy.short":             Signature(args=(), returns=_CONST_STRING, notes="SIGNATURE_ONLY"),
     "strategy.fixed":             Signature(args=(), returns=_CONST_STRING, notes="SIGNATURE_ONLY"),
