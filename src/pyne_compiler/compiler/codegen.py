@@ -116,7 +116,12 @@ import ast
 from typing import TYPE_CHECKING
 
 from pyne_compiler.compiler import ir
-from pyne_compiler.compiler.types import CompiledModule, SecurityContext
+from pyne_compiler.compiler.types import (
+    CompiledModule,
+    NaT,
+    Scalar,
+    SecurityContext,
+)
 from pyne_compiler.errors.base import PineCodegenError, PineUnsupportedFeatureError
 
 if TYPE_CHECKING:  # pragma: no cover — imports for typing only
@@ -335,6 +340,28 @@ GLOBAL_NAME_ALLOWLIST: frozenset[str] = frozenset({
 PYNE_HEADER_LINES: tuple[str, str] = ("@pyne", "openbb-pine: compiled module")
 
 
+def _pine_inner_to_py_type_name(inner) -> str | None:
+    """Map a Pine :class:`InnerType` to the Python type name PyneCore uses
+    inside ``Persistent[…]``. Returns ``None`` for inner types with no
+    natural scalar mapping (arrays, matrices, maps, UDTs) — bd-27v7 scope
+    covers scalar var-decls only; container persistence is future work.
+    """
+    if isinstance(inner, Scalar):
+        # Pine's ``color`` → Python ``str`` in PyneCore's runtime binding.
+        return {
+            "int": "int",
+            "float": "float",
+            "bool": "bool",
+            "string": "str",
+            "color": "str",
+        }[inner.kind]
+    if isinstance(inner, NaT):
+        # `na` without a declared type shouldn't reach us (the declared
+        # type is what we key on); defensively fall back to float.
+        return "float"
+    return None
+
+
 # Pine builtin namespace → which name must be imported from pynecore.lib.
 # When the script references ``ta.sma`` we need ``ta`` available; when it
 # references the bare ``close`` we need ``close``. The map keys mirror the
@@ -436,6 +463,10 @@ class _CodegenVisitor:
         # (name, default_call_expr) pairs to be lifted into def main(...) kwargs.
         # Order preserved — Python kwargs are positional-by-default-value.
         self._inputs: list[tuple[str, ast.expr]] = []
+        # bd-27v7 typed `var` decls emit ``Persistent[T]`` annotations; track
+        # which pynecore.types names we need so ``_build_types_import``
+        # emits the matching ``from pynecore.types import …`` line.
+        self._types_imports: set[str] = set()
 
     # ------------------------------------------------------------------
     # Entry point
@@ -492,6 +523,9 @@ class _CodegenVisitor:
         import_stmt = self._build_import_statement()
         if import_stmt is not None:
             module_body.append(import_stmt)
+        types_import = self._build_types_import_statement()
+        if types_import is not None:
+            module_body.append(types_import)
         module_body.append(main_fn)
 
         # Emit ``__security_contexts__ = {...}`` module-level constant so
@@ -548,6 +582,21 @@ class _CodegenVisitor:
         sorted_names = sorted(names)
         return ast.ImportFrom(
             module="pynecore.lib",
+            names=[ast.alias(name=n, asname=None) for n in sorted_names],
+            level=0,
+        )
+
+    def _build_types_import_statement(self) -> ast.ImportFrom | None:
+        """Emit ``from pynecore.types import Persistent[, NA]`` when the
+        script uses typed ``var`` decls (bd-27v7). Returns ``None`` when
+        no such decls appeared, keeping the output slim for the common
+        untyped-var case.
+        """
+        if not self._types_imports:
+            return None
+        sorted_names = sorted(self._types_imports)
+        return ast.ImportFrom(
+            module="pynecore.types",
             names=[ast.alias(name=n, asname=None) for n in sorted_names],
             level=0,
         )
@@ -746,14 +795,43 @@ class _CodegenVisitor:
         return ast.Assign(targets=[target], value=value, type_comment=None)
 
     def _visit_VarDecl(self, stmt: ir.VarDecl) -> ast.stmt:
-        # ``var x = e`` / ``varip x = e`` — PyneCore's @pyne magic handles
-        # var lifecycle via Persistent[T] annotations injected by its
-        # transformer. Phase-1 codegen just emits the plain assignment;
-        # the persistence semantics live in PyneCore.
-        # TODO(P3): emit ``x: Persistent[T] = e`` for var/varip so PyneCore's
-        # transformer keys off the annotation rather than the @pyne docstring.
-        # Phase-1 verifies the smoke-fixture path; persistence land in a
-        # follow-up bead once the conformance corpus has a var-using fixture.
+        # Untyped ``var x = e`` — plain assignment. PyneCore's @pyne magic
+        # only routes persistence through explicit ``Persistent[T]``
+        # annotations, so untyped var currently loses first-bar-only
+        # semantics (matches Phase-1 behavior; tracked separately).
+        #
+        # bd-27v7: typed ``var TYPE name = init`` (including ``na`` init)
+        # is now emitted as ``name: Persistent[T] = init`` so PyneCore's
+        # PersistentTransformer allocates a state-vector slot and enforces
+        # the first-bar-only semantics. The ``na`` initializer is wrapped
+        # as ``NA(T)`` because PyneCore's persistent slot needs a typed
+        # missing sentinel, not the bare ``na`` function.
+        if stmt.qualifier in ("var", "varip") and stmt.type is not None:
+            py_type = _pine_inner_to_py_type_name(stmt.type.inner)
+            if py_type is not None:
+                self._types_imports.add("Persistent")
+                # ``na`` initializer → ``NA(T)`` for typed persistence.
+                if isinstance(stmt.value, ir.NaLit):
+                    self._types_imports.add("NA")
+                    value: ast.expr = ast.Call(
+                        func=ast.Name(id="NA", ctx=ast.Load()),
+                        args=[ast.Name(id=py_type, ctx=ast.Load())],
+                        keywords=[],
+                    )
+                else:
+                    value = self._visit_expr(stmt.value)
+                annotation = ast.Subscript(
+                    value=ast.Name(id="Persistent", ctx=ast.Load()),
+                    slice=ast.Name(id=py_type, ctx=ast.Load()),
+                    ctx=ast.Load(),
+                )
+                return ast.AnnAssign(
+                    target=ast.Name(id=stmt.name, ctx=ast.Store()),
+                    annotation=annotation,
+                    value=value,
+                    simple=1,
+                )
+        # Untyped var / non-var typed decl fallback: plain assignment.
         value = self._visit_expr(stmt.value)
         target = ast.Name(id=stmt.name, ctx=ast.Store())
         return ast.Assign(targets=[target], value=value, type_comment=None)
