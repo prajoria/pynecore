@@ -119,7 +119,8 @@ class V5Rewrite:
 
 def _re(pattern: str, flags: int = 0) -> re.Pattern[str]:
     """Wrapper for :func:`re.compile` so the V5_REWRITES table reads
-    declaratively (no inline ``re.compile`` clutter)."""
+    declaratively (no inline ``re.compile`` clutter).
+    """
     return re.compile(pattern, flags)
 
 
@@ -278,9 +279,7 @@ _PRAGMA_PATTERN: re.Pattern[str] = re.compile(
 )
 
 
-def detect_pine_version(
-    source: str, *, telemetry: "TelemetrySink | None" = None
-) -> int:
+def detect_pine_version(source: str, *, telemetry: TelemetrySink | None = None) -> int:
     """Return 4, 5, or 6 based on the ``//@version=N`` pragma (D1 §1.2).
 
     Defaults to 6 when no pragma is present (consistent with the lexer's
@@ -342,9 +341,7 @@ def detect_pine_version(
 
 # Pragma line: `//@version=5` (column 0, optional trailing whitespace).
 # We rewrite the pragma so the parser dispatches the v6 grammar.
-_V5_PRAGMA_REWRITE: re.Pattern[str] = re.compile(
-    r"(?m)^//@version=5\s*$"
-)
+_V5_PRAGMA_REWRITE: re.Pattern[str] = re.compile(r"(?m)^//@version=5\s*$")
 
 
 # A short list of v5 tokens that signal "this rewrite isn't covered yet."
@@ -394,8 +391,200 @@ def _strip_line_comments(source: str) -> str:
     return _LINE_COMMENT.sub("", source)
 
 
+# ---------------------------------------------------------------------------
+# #592: strategy.*(when=…) → strategy.*(…)  — v5→v6 order-placement rewrite
+# ---------------------------------------------------------------------------
+
+# The seven Pine v5 order-placement functions that v6 stripped `when=` from.
+# Kept explicit rather than a wildcard so a future v6 addition of a strategy.*
+# call that legitimately takes a `when=` (unlikely, but the shim wouldn't know)
+# doesn't get chewed by accident.
+_STRATEGY_WHEN_STRIP_FUNCTIONS: tuple[str, ...] = (
+    "strategy.entry",
+    "strategy.order",
+    "strategy.exit",
+    "strategy.close_all",  # BEFORE strategy.close so the regex prefers the longer match
+    "strategy.close",
+    "strategy.cancel_all",  # BEFORE strategy.cancel likewise
+    "strategy.cancel",
+)
+
+# One matcher against every strategy.* call opener. Iteration below walks each
+# match, finds the balanced paren pair, and rewrites the arglist in-place.
+# Ordered longest-first so `strategy.close_all(` matches before `strategy.close(`
+# would in an alt-group.
+_STRATEGY_CALL_OPENER: re.Pattern[str] = re.compile(
+    r"\bstrategy\.(?:entry|order|exit|close_all|close|cancel_all|cancel)\s*\("
+)
+
+
+def _find_matching_paren(text: str, open_paren_idx: int) -> int | None:
+    """Return the index of the ``)`` that closes the ``(`` at
+    ``open_paren_idx``, or ``None`` if no balanced closer exists
+    (unterminated, or nested-string edge-case that would trip a naive
+    scanner).
+
+    Skips over single- and double-quoted string literals so a ``)`` inside
+    a string is not mistaken for the closer. Does NOT handle triple-quoted
+    strings — Pine has none. Does NOT handle escape sequences other than
+    ``\\"`` and ``\\'``; Pine strings are simple.
+
+    Silent failure (``None``) is intentional: if the call site is
+    unbalanced, we leave it unchanged and let the parser produce a
+    grammar error at its usual site rather than corrupt the source.
+    """
+    assert text[open_paren_idx] == "(", "must start at an opening paren"
+    depth = 0
+    i = open_paren_idx
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ("'", '"'):
+            # Walk past the string literal.
+            quote = ch
+            i += 1
+            while i < n and text[i] != quote:
+                if text[i] == "\\" and i + 1 < n:
+                    i += 2  # skip escaped char
+                    continue
+                i += 1
+            if i >= n:
+                return None  # unterminated string
+            i += 1  # skip the closing quote
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _split_top_level_args(arglist: str) -> list[str] | None:
+    """Split a Pine call's argument list on top-level commas.
+
+    ``arglist`` is the text BETWEEN the outer parens (no surrounding
+    whitespace stripping). Returns ``None`` if the arglist is malformed
+    (unbalanced parens or unterminated string) — caller should leave the
+    call unchanged in that case.
+
+    Skips commas inside strings and inside nested parens/brackets so a
+    call like ``strategy.exit("tp", when=math.max(a, b), profit=10)`` is
+    split as three args, not five.
+    """
+    args: list[str] = []
+    depth = 0
+    start = 0
+    i = 0
+    n = len(arglist)
+    while i < n:
+        ch = arglist[i]
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            while i < n and arglist[i] != quote:
+                if arglist[i] == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                i += 1
+            if i >= n:
+                return None
+            i += 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif ch == "," and depth == 0:
+            args.append(arglist[start:i])
+            start = i + 1
+        i += 1
+    if depth != 0:
+        return None
+    args.append(arglist[start:])
+    return args
+
+
+def _strip_when_arg_from_strategy_calls(source: str) -> tuple[str, int]:
+    """Remove the ``when=`` kwarg from every ``strategy.*`` call in
+    ``source`` (see :data:`_STRATEGY_WHEN_STRIP_FUNCTIONS`).
+
+    Returns ``(new_source, count)`` where ``count`` is the number of
+    call sites where a ``when=`` was actually stripped. A call site with
+    no ``when=`` kwarg is not counted.
+
+    Semantics:
+      * Simple arg forms are stripped in place — the remaining arglist is
+        rejoined with commas and the call's opening/closing parens are
+        preserved verbatim.
+      * A call whose argument list is malformed (unbalanced parens or
+        unterminated string) is left unchanged; the parser produces the
+        real error a few passes later.
+      * A ``when=`` occurrence inside a nested call's arg list (e.g. a
+        v5 user wrapped ``strategy.exit`` around another builtin that
+        happens to take a ``when=`` kwarg — unusual but not impossible)
+        is NOT rewritten by this pass; only the outer ``strategy.*``
+        arglist is walked.
+
+    Idempotent: after a strip pass, the call has no ``when=`` kwarg, so a
+    second pass over the same source strips zero and returns the input
+    unchanged. Assertion coverage in
+    ``tests/unit/test_v5_migration.py::TestIdempotence``.
+    """
+    # Walk left→right, rewriting as we go. Because rewrites shorten the
+    # source, we track the offset delta relative to the original scan and
+    # keep the match indices valid against the original string.
+    out_parts: list[str] = []
+    cursor = 0
+    strip_count = 0
+
+    for opener in _STRATEGY_CALL_OPENER.finditer(source):
+        # Copy verbatim from the last cursor up to (and including) the
+        # ``(`` — the opener match ends at index `opener.end() - 1` for
+        # the paren, so `opener.end()` is the first arg-list char.
+        open_paren_idx = opener.end() - 1
+        close_paren_idx = _find_matching_paren(source, open_paren_idx)
+        if close_paren_idx is None:
+            # Malformed call — leave it alone.
+            continue
+
+        arglist = source[open_paren_idx + 1 : close_paren_idx]
+        parts = _split_top_level_args(arglist)
+        if parts is None:
+            continue
+
+        # Filter out any arg that is a `when=` kwarg. `when` must be the
+        # LHS of an `=`, not the RHS of something like `x = when_flag`.
+        # Match ``\s* when \s* = ...``.
+        _WHEN_KWARG = re.compile(r"^\s*when\s*=")
+        kept = [p for p in parts if not _WHEN_KWARG.match(p)]
+        if len(kept) == len(parts):
+            # No `when=` found in this call — nothing to strip.
+            continue
+
+        strip_count += len(parts) - len(kept)
+        # Reconstruct the arglist. If a `when=` was the ONLY arg
+        # (e.g. `strategy.close_all(when=cond)` → `strategy.close_all()`),
+        # `kept` is []; the rejoin naturally produces "".
+        new_arglist = ",".join(kept)
+
+        # Emit source[cursor : open_paren_idx+1] + new_arglist + ")"
+        out_parts.append(source[cursor : open_paren_idx + 1])
+        out_parts.append(new_arglist)
+        out_parts.append(")")
+        cursor = close_paren_idx + 1
+
+    # Tail.
+    out_parts.append(source[cursor:])
+    return "".join(out_parts), strip_count
+
+
 def migrate_v5_to_v6(
-    source: str, *, telemetry: "TelemetrySink | None" = None
+    source: str, *, telemetry: TelemetrySink | None = None
 ) -> tuple[str, list[str]]:
     """Apply every entry in :data:`V5_REWRITES` to a v5 source string.
 
@@ -435,6 +624,17 @@ def migrate_v5_to_v6(
         out, n = rewrite.apply(out)
         if n > 0:
             log.append(f"{rewrite.name} ({n} substitution(s))")
+
+    # #592 — strip `when=` from every strategy.* order-placement call. Lives
+    # outside V5_REWRITES because it needs balanced-paren + string-literal
+    # awareness that plain re.subn can't safely deliver. Runs AFTER the
+    # regex pass so it sees any earlier normalisations (none today, but
+    # the ordering is stable for future rewrites that touch strategy.*).
+    out, when_strip_n = _strip_when_arg_from_strategy_calls(out)
+    if when_strip_n > 0:
+        log.append(
+            f"strategy.*(when=…) → strategy.*(…) ({when_strip_n} substitution(s))"
+        )
 
     # Last step: rewrite the pragma. Doing this AFTER the rewrites means a
     # malformed pragma rewrite won't leave us with a v6 grammar pointed at
